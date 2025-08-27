@@ -75,14 +75,7 @@ class BehaviorAssociator:
                     temp_polygons.append(coords)
                     temp_centroids.append(jnp.mean(coords, axis=0))
                     temp_labels.append(name)
-                    # NOTE: Colors will be determined in the `visualize` method
                     temp_colors.append('blue')
-                elif isinstance(coords, tuple) and coords[0] == "circle":
-                    center_x, center_y, radius = coords[1]
-                    temp_polygons.append(jnp.array([[center_x, center_y]], dtype=jnp.float32))
-                    temp_centroids.append(jnp.array([center_x, center_y], dtype=jnp.float32))
-                    temp_labels.append(name)
-                    temp_colors.append('red')
 
         padded_polygons_for_stack = []
         for p in temp_polygons:
@@ -100,7 +93,7 @@ class BehaviorAssociator:
 
         robot_position_jnp = jnp.asarray(robot_position, dtype=jnp.float32)
 
-        MAX_DATA_DIM = max(self.MAX_POLYGON_VERTICES * 2 + 1, 3 + 1)
+        MAX_DATA_DIM = self.MAX_POLYGON_VERTICES * 2 + 1
 
         region_ids_list = []
         region_data_list = []
@@ -138,6 +131,9 @@ class BehaviorAssociator:
                 new_behavior_id = jnp.where(is_in_poly, region_id, current_behavior_id)
                 
                 new_is_found_flag = jnp.logical_or(is_found_flag, is_in_poly)
+                # jd.print("in poly? {}", is_in_poly)
+                # jd.print("new id: {}", new_behavior_id)
+                # jd.print("found flag: {}", new_is_found_flag)
 
                 return (new_behavior_id, new_is_found_flag), None
 
@@ -155,31 +151,35 @@ class BehaviorAssociator:
         is_degenerate_polygon = (num_actual_vertices < 3)
         if_degenerate_result = jnp.array(False)
 
+        # Closes polygon by adding first vertex at the end of the padded list
         first_vertex_index = jnp.array([0])
         first_actual_vertex = jax.lax.dynamic_slice(polygon_padded, (0, 0), (1, 2)).squeeze()
-
         closed_polygon_padded = jnp.concatenate((polygon_padded, first_actual_vertex[jnp.newaxis, :]), axis=0)
 
+        # Forms edges with pairs of adjacent vertex coordinates in the polygon array
         p1_coords = closed_polygon_padded[:-1]
         p2_coords = closed_polygon_padded[1:]
         edges = jnp.stack((p1_coords, p2_coords), axis=1)
 
+        # Initial check if point is a vertex
         is_vertex = jnp.any(jnp.where(jnp.arange(self.MAX_POLYGON_VERTICES)[:, None] < num_actual_vertices,
                                         jnp.all(jnp.isclose(point, polygon_padded), axis=1),
                                         False))
-
         initial_inside = jnp.where(is_vertex, jnp.array(True), jnp.array(False))
 
+        # Core ray-casting algorithm
         def scan_body(current_inside_state, i):
             is_actual_edge = (i < num_actual_vertices)
 
             p1x, p1y = edges[i, 0]
             p2x, p2y = edges[i, 1]
 
+            # For actual edges
             def true_fn():
+                
+                # Horizontal ray's y-coord should lie between the y-coords of the edge vertices 
                 cond1 = y > jnp.min(jnp.array([p1y, p2y]))
                 cond2 = y <= jnp.max(jnp.array([p1y, p2y]))
-                cond3 = x <= jnp.max(jnp.array([p1x, p2x]))
 
                 denominator = p2y - p1y
                 x_intercept = jnp.where(
@@ -188,6 +188,7 @@ class BehaviorAssociator:
                     jnp.inf * jnp.sign(x)
                 )
 
+                # If cond1, cond2 and x < x_intercept, ray has to cross the edge so in/out flag should toggle
                 should_toggle_base = jnp.logical_and(
                     cond1,
                     jnp.logical_and(
@@ -201,6 +202,8 @@ class BehaviorAssociator:
 
                 line_vec = edges[i, 1] - edges[i, 0]
                 point_vec = point - edges[i, 0]
+                
+                # Check if point is along edge
                 cross_product = line_vec[0] * point_vec[1] - line_vec[1] * point_vec[0]
                 is_collinear = jnp.isclose(cross_product, 0.0)
                 dot_product = jnp.dot(point_vec, line_vec)
@@ -208,19 +211,26 @@ class BehaviorAssociator:
                 is_within_segment = jnp.where(squared_length > 1e-6, jnp.logical_and(dot_product >= 0, dot_product <= squared_length), False)
                 is_on_segment = jnp.logical_and(is_collinear, is_within_segment)
 
+                # Horizontal-edge edge case (don't count as an intersection)
                 is_horizontal = jnp.isclose(p1y, p2y)
                 should_toggle = jnp.where(is_horizontal, jnp.array(False), should_toggle_base)
 
+                # Toggles if it should be toggled
                 new_inside_state = jnp.where(should_toggle, jnp.logical_not(current_inside_state), current_inside_state)
+                
+                # On polygon border considered in 
                 final_inside_state = jnp.where(is_on_segment, jnp.array(True), new_inside_state)
+                
                 return final_inside_state
 
+            # For padded edges
             def false_fn():
                 return current_inside_state
 
             updated_inside = jax.lax.cond(is_actual_edge, true_fn, false_fn)
             return updated_inside, None
 
+        # Calls the scan_body function above for every vertex (and therefore edge) simultaneously
         final_inside_if_valid, _ = jax.lax.scan(scan_body, initial_inside, jnp.arange(self.MAX_POLYGON_VERTICES + 1))
         return jnp.where(is_degenerate_polygon, if_degenerate_result, final_inside_if_valid)
 
@@ -270,10 +280,6 @@ class BehaviorAssociator:
         ax.legend(loc='upper right', fontsize='small')
 
     def _get_region_visualization_properties(self) -> Dict[str, Dict[str, Any]]:
-        """
-        Returns a dictionary mapping region names to visualization properties.
-        This method MUST be overridden by subclasses.
-        """
         raise NotImplementedError("Subclasses must implement _get_region_visualization_properties()")
 
     @partial(jax.jit, static_argnums=(0,))
