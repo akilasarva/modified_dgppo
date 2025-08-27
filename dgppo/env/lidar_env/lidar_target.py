@@ -527,6 +527,13 @@ def _calculate_cluster_reward_per_agent(
     current_cluster_oh_episode_i: Array,
     start_cluster_oh_episode_i: Array,
     next_cluster_oh_episode_i: Array,
+    # Bridge parameters needed to reconstruct BehaviorAssociator
+    # bridge_center: Array,
+    # bridge_length: float, # Overall bridge length
+    # bridge_gap_width: float,
+    # bridge_wall_thickness: float,
+    # bridge_theta: float, # In radians
+    # environment_area_size: float,
     # LidarEnv class attributes needed for logic (passed from LidarEnv instance)
     cluster_map: Dict[str, int],
     id_to_curriculum_prefix_map: Dict[int, str], # Python dict
@@ -670,12 +677,12 @@ class LidarTarget(LidarEnv):
         vmap_cluster_reward_fn = jax_vmap(ft.partial(
             _calculate_cluster_reward_per_agent,
             # Pass bridge parameters required by BehaviorAssociator
-            bridge_center=bridge_center,
-            bridge_length=bridge_length,
-            bridge_gap_width=bridge_gap_width,
-            bridge_wall_thickness=bridge_wall_thickness,
-            bridge_theta=bridge_theta,
-            environment_area_size=self.area_size,
+            # bridge_center=bridge_center,
+            # bridge_length=bridge_length,
+            # bridge_gap_width=bridge_gap_width,
+            # bridge_wall_thickness=bridge_wall_thickness,
+            # bridge_theta=bridge_theta,
+            # environment_area_size=self.area_size,
             cluster_map=self.CLUSTER_MAP,
             id_to_curriculum_prefix_map=self._id_to_curriculum_prefix_map, 
             allowed_id_transitions_array=self.CURRICULUM_TRANSITIONS_INT_IDS, # Corrected name

@@ -471,8 +471,9 @@ class LidarEnv(MultiAgentEnv, ABC):
                 # jd.print("start tracer: {}", start_region_id_tracer)
                 start_cluster_idx = start_region_id_tracer 
                 key_agent_pos, key_goal_pos, key_rot, key_loop = jr.split(key, 4)
-                jd.print("normal: {}", jr.normal(key_agent_pos, (2,)) * 0.05)
-                jd.print("centroids: {}", associator.all_region_centroids_jax_array)
+                # jd.print("normal: {}", jr.normal(key_agent_pos, (2,)) * 0.05)
+                # jd.print("centroids: {}", associator.all_region_centroids_jax_array)
+                jd.print("Region order: {}", associator.region_labels)
                 jd.print("0: {}", associator.get_current_behavior(associator.all_region_centroids_jax_array[0])) #+jr.normal(key_agent_pos, (2,)) * 0.05))
                 jd.print("1: {}", associator.get_current_behavior(associator.all_region_centroids_jax_array[1])) #+jr.normal(key_agent_pos, (2,)) * 0.05))
                 jd.print("2: {}", associator.get_current_behavior(associator.all_region_centroids_jax_array[2])) #+jr.normal(key_agent_pos, (2,)) * 0.05))
@@ -481,11 +482,11 @@ class LidarEnv(MultiAgentEnv, ABC):
                 next_cluster_idx = next_region_id_tracer
                 jd.print("start idx: {}", start_cluster_idx)
                 jd.print("current idx: {}", current_cluster_idx)
-                jd.print("centroid at start: {}", next_cluster_idx)
+                jd.print("next idx: {}", next_cluster_idx)
                 
                 current_cluster_oh = jax.nn.one_hot(current_cluster_idx, self.n_cluster)
-                jd.print("current oh: {}", current_cluster_oh)
-                jd.print("current idx")
+                # jd.print("current oh: {}", current_cluster_oh)
+                # jd.print("current idx")
                 start_cluster_oh = jax.nn.one_hot(start_cluster_idx, self.n_cluster)
                 next_cluster_oh = jax.nn.one_hot(next_cluster_idx, self.n_cluster)
 
