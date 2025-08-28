@@ -7,6 +7,7 @@ import functools as ft
 import jax.tree_util as jtu
 from functools import partial
 import jax.debug as jd
+import ipdb
 
 from colour import hsl2hex
 from matplotlib.animation import FuncAnimation
@@ -26,17 +27,11 @@ class BehaviorAssociator:
         self.buildings = buildings
         self.obstacles = obstacles
         self.all_region_names = all_region_names  # Store the master list
-
         self.behavior_regions = self._define_behavior_regions()
 
         self._initialize_full_region_maps()
         
         self._prepare_jax_data()
-
-    def _initialize_region_maps(self):
-        self.region_name_to_id = {name: i for i, name in enumerate(self.behavior_regions.keys())}
-        self.region_id_to_name = {v: k for k, v in self.region_name_to_id.items()}
-        self.sorted_region_names = sorted(self.region_name_to_id, key=self.region_name_to_id.get)
 
     def _initialize_full_region_maps(self):
         self.region_name_to_id = {name: i for i, name in enumerate(self.all_region_names)}
@@ -131,9 +126,6 @@ class BehaviorAssociator:
                 new_behavior_id = jnp.where(is_in_poly, region_id, current_behavior_id)
                 
                 new_is_found_flag = jnp.logical_or(is_found_flag, is_in_poly)
-                # jd.print("in poly? {}", is_in_poly)
-                # jd.print("new id: {}", new_behavior_id)
-                # jd.print("found flag: {}", new_is_found_flag)
 
                 return (new_behavior_id, new_is_found_flag), None
 
@@ -144,24 +136,23 @@ class BehaviorAssociator:
 
         return _get_behavior_jit(robot_position_jnp) 
 
-    @partial(jax.jit, static_argnums=(0,))
+    #@partial(jax.jit, static_argnums=(0, 3))
     def _is_point_in_polygon(self, point, polygon_padded, num_actual_vertices):
         x, y = point
 
         is_degenerate_polygon = (num_actual_vertices < 3)
         if_degenerate_result = jnp.array(False)
+                
+        first_actual_vertex = polygon_padded[0, :]
+        all_vertices = jnp.concatenate((polygon_padded, first_actual_vertex[jnp.newaxis, :]), axis=0)
 
-        # Closes polygon by adding first vertex at the end of the padded list
-        first_vertex_index = jnp.array([0])
-        first_actual_vertex = jax.lax.dynamic_slice(polygon_padded, (0, 0), (1, 2)).squeeze()
-        closed_polygon_padded = jnp.concatenate((polygon_padded, first_actual_vertex[jnp.newaxis, :]), axis=0)
-
-        # Forms edges with pairs of adjacent vertex coordinates in the polygon array
-        p1_coords = closed_polygon_padded[:-1]
-        p2_coords = closed_polygon_padded[1:]
+        p1_coords = all_vertices[:-1]
+        p2_coords = all_vertices[1:]
+        
+        p2_coords = p2_coords.at[num_actual_vertices-1].set(first_actual_vertex)
+        
         edges = jnp.stack((p1_coords, p2_coords), axis=1)
 
-        # Initial check if point is a vertex
         is_vertex = jnp.any(jnp.where(jnp.arange(self.MAX_POLYGON_VERTICES)[:, None] < num_actual_vertices,
                                         jnp.all(jnp.isclose(point, polygon_padded), axis=1),
                                         False))
@@ -171,6 +162,8 @@ class BehaviorAssociator:
         def scan_body(current_inside_state, i):
             is_actual_edge = (i < num_actual_vertices)
 
+            # This check is now robust because the edges array is correctly formed
+            # with the closed polygon data, followed by padded zeros.
             p1x, p1y = edges[i, 0]
             p2x, p2y = edges[i, 1]
 
@@ -179,15 +172,15 @@ class BehaviorAssociator:
                 
                 # Horizontal ray's y-coord should lie between the y-coords of the edge vertices 
                 cond1 = y > jnp.min(jnp.array([p1y, p2y]))
-                cond2 = y <= jnp.max(jnp.array([p1y, p2y]))
-
+                cond2 = y < jnp.max(jnp.array([p1y, p2y]))
+                
                 denominator = p2y - p1y
                 x_intercept = jnp.where(
                     denominator != 0.0,
                     (y - p1y) * (p2x - p1x) / denominator + p1x,
                     jnp.inf * jnp.sign(x)
                 )
-
+                
                 # If cond1, cond2 and x < x_intercept, ray has to cross the edge so in/out flag should toggle
                 should_toggle_base = jnp.logical_and(
                     cond1,
@@ -199,7 +192,7 @@ class BehaviorAssociator:
                         )
                     )
                 )
-
+                
                 line_vec = edges[i, 1] - edges[i, 0]
                 point_vec = point - edges[i, 0]
                 

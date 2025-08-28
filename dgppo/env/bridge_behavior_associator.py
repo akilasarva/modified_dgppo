@@ -57,7 +57,7 @@ class BehaviorBridge(BehaviorAssociator):
             local_corners = jnp.array([
                 [-half_l, -half_w], # Bottom-left
                 [ half_l, -half_w], # Bottom-right
-                [ half_l,  half_w], # Top-right
+                [ half_l,  half_w], # Top-rightaq   
                 [-half_l,  half_w]  # Top-left
             ], dtype=jnp.float32)
 

@@ -5,6 +5,7 @@ import numpy as np # Keep if needed for other non-JAX ops, but avoid for JAX arr
 import functools as ft
 import jax
 import jax.debug as jd
+import ipdb
 
 from typing import NamedTuple, Tuple, Optional, List, Dict # Added List, Dict for type hints
 from abc import ABC, abstractmethod
@@ -30,7 +31,8 @@ class LidarEnvState(NamedTuple):
     current_cluster_oh: Float[Array, "n_agent n_cluster"]
     start_cluster_oh: Float[Array, "n_agent n_cluster"]
     next_cluster_oh: Float[Array, "n_agent n_cluster"]
-    
+    next_cluster_bonus_awarded: jnp.ndarray
+
     bridge_center: Float[Array, "2"]
     bridge_length: float
     bridge_gap_width: float
@@ -224,6 +226,7 @@ class LidarEnv(MultiAgentEnv, ABC):
         bridge_gap_width_env_state: Float[Array, ""] = jnp.array(0.0)
         bridge_wall_thickness_env_state: Float[Array, ""] = jnp.array(0.0)
         bridge_theta_env_state: Float[Array, ""] = jnp.array(0.0)
+        initial_bonus_awarded = jnp.zeros(self.num_agents, dtype=jnp.bool_)
 
         num_bridges = 1 
 
@@ -360,19 +363,10 @@ class LidarEnv(MultiAgentEnv, ABC):
                 (center2[0], center2[1], wall_width, wall_height, bridge_theta_deg)
             ]
 
-            # associator = BehaviorAssociator(
-            #     bridges=bridges_for_associator,
-            #     buildings=[], 
-            #     obstacles=[],
-            #     region_name_to_id=self.CLUSTER_MAP,        # Pass the map
-            #     region_id_to_name=self._id_to_curriculum_prefix_map # Pass the reverse map
-            # )
-            
             associator = BehaviorBridge(
                 bridges=bridges_for_associator,
                 all_region_names=self.ALL_POSSIBLE_REGION_NAMES
             )
-
 
             agent_states_list = []
             goal_states_list = []
@@ -393,7 +387,7 @@ class LidarEnv(MultiAgentEnv, ABC):
             
             exit_direction_vector = jnp.array([jnp.cos(bridge_theta_env_state), jnp.sin(bridge_theta_env_state)])
             
-            open_space_goal_distance = 0.5 #self.params["open_space_goal_distance"]
+            open_space_goal_distance = 0.4 #self.params["open_space_goal_distance"]
             
             open_space_goal_pos = exit_bridge_centroid + exit_direction_vector * open_space_goal_distance
 
@@ -407,7 +401,7 @@ class LidarEnv(MultiAgentEnv, ABC):
                                         jnp.zeros(2), # Default if NaN
                                         initial_pos_candidate)
                 
-                initial_pos = initial_pos #+ jr.normal(key_agent_pos, (2,)) * 0.05
+                initial_pos = initial_pos + jr.normal(key_agent_pos, (2,)) * 0.05
                 initial_pos = jnp.clip(initial_pos, 0, self.area_size)
 
                 goal_pos_candidate = associator.get_region_centroid(next_region_id_tracer)
@@ -424,7 +418,7 @@ class LidarEnv(MultiAgentEnv, ABC):
                                     jnp.array([self.area_size / 2, self.area_size / 2]), # Fallback to center, not origin
                                     goal_pos)
                 
-                goal_pos = goal_pos #+ jr.normal(key_goal_pos, (2,)) * 0.05
+                goal_pos = goal_pos + jr.normal(key_goal_pos, (2,)) * 0.05
     
                 rot_angle = 0 #jr.uniform(key_rot, (), minval=-jnp.pi/4, maxval=jnp.pi/4)
 
@@ -441,34 +435,14 @@ class LidarEnv(MultiAgentEnv, ABC):
                 rotated_goal_pos = bridge_center_env_state + rotated_goal_pos_relative
                 
                 goal_pos = rotated_goal_pos
-                
-                #goal_pos = jnp.array([0.6378663, 0.5404814])
-                # jd.print("initial pos: {}", initial_pos)
-                # jd.print("goal pos: {}", goal_pos)
-                #jd.print("rotation: {}", rot_angle*180/jnp.pi)
 
                 bearing = jnp.arctan2(goal_pos[1] - initial_pos[1], goal_pos[0] - initial_pos[0]) #- jnp.pi/4
 
-                # jd.print("centroids: {}", associator.all_region_centroids_jax_array)
-                # jd.print("start tracer: {}", start_region_id_tracer)
                 start_cluster_idx = start_region_id_tracer 
-                key_agent_pos, key_goal_pos, key_rot, key_loop = jr.split(key, 4)
-                # jd.print("normal: {}", jr.normal(key_agent_pos, (2,)) * 0.05)
-                # jd.print("centroids: {}", associator.all_region_centroids_jax_array)
-                jd.print("Region order: {}", associator.region_labels)
-                jd.print("0: {}", associator.get_current_behavior(associator.all_region_centroids_jax_array[0])) #+jr.normal(key_agent_pos, (2,)) * 0.05))
-                jd.print("1: {}", associator.get_current_behavior(associator.all_region_centroids_jax_array[1])) #+jr.normal(key_agent_pos, (2,)) * 0.05))
-                jd.print("2: {}", associator.get_current_behavior(associator.all_region_centroids_jax_array[2])) #+jr.normal(key_agent_pos, (2,)) * 0.05))
-                jd.print("3: {}", associator.get_current_behavior(associator.all_region_centroids_jax_array[3])) #+jr.normal(key_agent_pos, (2,)) * 0.05))
                 current_cluster_idx = jnp.squeeze(associator.get_current_behavior(initial_pos))
                 next_cluster_idx = next_region_id_tracer
-                jd.print("start idx: {}", start_cluster_idx)
-                jd.print("current idx: {}", current_cluster_idx)
-                jd.print("next idx: {}", next_cluster_idx)
                 
                 current_cluster_oh = jax.nn.one_hot(current_cluster_idx, self.n_cluster)
-                # jd.print("current oh: {}", current_cluster_oh)
-                # jd.print("current idx")
                 start_cluster_oh = jax.nn.one_hot(start_cluster_idx, self.n_cluster)
                 next_cluster_oh = jax.nn.one_hot(next_cluster_idx, self.n_cluster)
 
@@ -514,6 +488,7 @@ class LidarEnv(MultiAgentEnv, ABC):
             current_cluster_oh=current_clusters,
             start_cluster_oh=start_clusters,
             next_cluster_oh=next_clusters,
+            next_cluster_bonus_awarded=initial_bonus_awarded,
             bridge_center=bridge_center_env_state,
             bridge_length=bridge_length_env_state,
             bridge_gap_width=bridge_gap_width_env_state,
@@ -561,6 +536,7 @@ class LidarEnv(MultiAgentEnv, ABC):
         bridge_gap_width = graph.env_states.bridge_gap_width
         bridge_wall_thickness = graph.env_states.bridge_wall_thickness
         bridge_theta = graph.env_states.bridge_theta
+        next_cluster_bonus_awarded = graph.env_states.next_cluster_bonus_awarded
         
         cos_theta = jnp.cos(bridge_theta)
         sin_theta = jnp.sin(bridge_theta)
@@ -590,20 +566,19 @@ class LidarEnv(MultiAgentEnv, ABC):
             bridges=bridge_walls_params,
             all_region_names=self.ALL_POSSIBLE_REGION_NAMES
         )
-        actual_cluster_id = jax_vmap(associator.get_current_behavior)(agent_base_states[:, :2])
-        # jd.print("aactual: {}", actual_cluster_id)
-        # jd.print("og: {}", jax_vmap(associator.get_current_behavior)(agent_base_states[:, :2]))
-        ex = graph.env_states.current_cluster_oh #
-        #jd.print("current: {}", current_cluster_oh)
-        current_cluster_oh = jax.nn.one_hot(actual_cluster_id, self.n_cluster) 
-        #jd.print("test: {}", test)
+        current_id = jax_vmap(associator.get_current_behavior)(agent_base_states[:, :2])
+        current_cluster_oh = jax.nn.one_hot(current_id, self.n_cluster)
         start_cluster_oh = graph.env_states.start_cluster_oh
         next_cluster_oh = graph.env_states.next_cluster_oh
 
         # calculate next states
         action = self.clip_action(action)
         next_agent_base_states = self.agent_step_euler(agent_base_states, action) # Only update (x,y,vx,vy)
-        #jd.print("Action: {}", action)
+        
+        reward, bonus_awarded_updated = self.get_reward(graph, action)
+        cost = self.get_cost(graph)
+        assert reward.shape == tuple()
+
 
         next_env_state = LidarEnvState(
             next_agent_base_states, 
@@ -613,21 +588,17 @@ class LidarEnv(MultiAgentEnv, ABC):
             current_cluster_oh,
             start_cluster_oh,
             next_cluster_oh,
+            bonus_awarded_updated,
             bridge_center,
             bridge_length,
             bridge_gap_width,
             bridge_wall_thickness,
-            bridge_theta,
+            bridge_theta
         )
         
         lidar_data_next = self.get_lidar_data(next_agent_base_states, obstacles)
         info = {}
-
         done = jnp.array(False)
-
-        reward = self.get_reward(graph, action)
-        cost = self.get_cost(graph)
-        assert reward.shape == tuple()
 
         return self.get_graph(next_env_state, lidar_data_next), reward, cost, done, info
 
@@ -712,10 +683,6 @@ class LidarEnv(MultiAgentEnv, ABC):
             lidar_data = merge01(lidar_data)
         elif n_hits > 0:
             lidar_data = jnp.zeros((n_hits, 2), dtype=jnp.float32)
-            
-        # jd.print("current oh: {}", state.current_cluster_oh)
-        # jd.print("start oh: {}", state.start_cluster_oh)
-        # jd.print("next oh: {}", state.next_cluster_oh)
 
         # Node features: (x, y, vx, vy, bearing, current_cluster_oh, start_cluster_oh, next_cluster_oh, is_obs, is_goal, is_agent)
         node_feats = jnp.zeros((n_nodes, self.node_dim), dtype=jnp.float32)
