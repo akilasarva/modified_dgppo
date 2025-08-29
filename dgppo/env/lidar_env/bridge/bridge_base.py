@@ -536,7 +536,6 @@ class LidarEnv(MultiAgentEnv, ABC):
         bridge_gap_width = graph.env_states.bridge_gap_width
         bridge_wall_thickness = graph.env_states.bridge_wall_thickness
         bridge_theta = graph.env_states.bridge_theta
-        next_cluster_bonus_awarded = graph.env_states.next_cluster_bonus_awarded
         
         cos_theta = jnp.cos(bridge_theta)
         sin_theta = jnp.sin(bridge_theta)
@@ -578,7 +577,6 @@ class LidarEnv(MultiAgentEnv, ABC):
         reward, bonus_awarded_updated = self.get_reward(graph, action)
         cost = self.get_cost(graph)
         assert reward.shape == tuple()
-
 
         next_env_state = LidarEnvState(
             next_agent_base_states, 

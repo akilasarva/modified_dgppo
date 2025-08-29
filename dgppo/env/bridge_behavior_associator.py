@@ -1,16 +1,10 @@
 import jax.numpy as jnp
 import numpy as np
-import matplotlib.pyplot as plt
 from matplotlib.patches import Polygon
-from typing import List, Tuple, Dict, Any
+from typing import List, Dict, Any
 from functools import partial
-import pathlib
-import jax.numpy as jnp
-import jax.random as jr
 import numpy as np 
-import functools as ft
 import jax
-import jax.debug as jd
 
 from dgppo.env.behavior_associator import BehaviorAssociator
 

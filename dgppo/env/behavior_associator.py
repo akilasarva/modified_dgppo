@@ -47,11 +47,12 @@ class BehaviorAssociator:
         temp_labels = []
         temp_colors = []
 
-        self.MAX_POLYGON_VERTICES = 32
+        self.MAX_POLYGON_VERTICES = 4
         for name, coords in self.behavior_regions.items():
             if isinstance(coords, jnp.ndarray) and coords.ndim == 2:
                 self.MAX_POLYGON_VERTICES = max(self.MAX_POLYGON_VERTICES, coords.shape[0])
 
+        #priority_order = ["open_space", "approach_bridge", "on_bridge", "exit_bridge"]
         # priority_order = ["open_space", "approach_bridge", "on_bridge", "exit_bridge"]
     
         # reordered_names = []

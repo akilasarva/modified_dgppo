@@ -1,4 +1,3 @@
-
 import jax.numpy as jnp
 import jax.debug as jdebug
 
@@ -28,7 +27,6 @@ def _calculate_bearing_reward(agent_vel: jnp.ndarray, target_bearing: float) -> 
     return cosine_sim 
 
 def _calculate_cluster_reward_per_agent(
-    agent_pos_i: Array,
     current_cluster_oh_episode_i: Array,
     start_cluster_oh_episode_i: Array,
     next_cluster_oh_episode_i: Array,
@@ -92,7 +90,7 @@ class LidarTarget(LidarEnv):
     PARAMS = {
         "car_radius": 0.05,
         "comm_radius": 0.5,
-        "n_rays": 36,
+        "n_rays": 32,
         "obs_len_range": [0.1, 0.3],
         "n_obs": 2,
         "default_area_size": 1.5,
@@ -185,7 +183,6 @@ class LidarTarget(LidarEnv):
         reward -= (jnp.linalg.norm(action, axis=1) ** 2).mean() * 0.001
 
         return reward*0.1, next_cluster_bonus_awarded_updated
-
     
     def state2feat(self, state: State) -> Array:
         return state

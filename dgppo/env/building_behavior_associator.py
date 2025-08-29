@@ -31,13 +31,6 @@ class BehaviorBuildings(BehaviorAssociator):
             half_width = building_width / 2.0
             half_height = building_height / 2.0
 
-            # In-Building Region
-            in_building_corners_local = jnp.array([
-                [-half_width, -half_height], [half_width, -half_height],
-                [half_width, half_height], [-half_width, half_height],
-            ])
-            #regions["in_building"] = jnp.einsum('ij,kj->ki', rotation_matrix, in_building_corners_local) + building_center
-
             wall_thickness = half_width
             corner_size = half_width*2/3
 
@@ -142,9 +135,6 @@ class BehaviorBuildings(BehaviorAssociator):
         return regions
 
     def _get_region_visualization_properties(self) -> Dict[str, Dict[str, Any]]:
-        """
-        Returns a dictionary mapping building region names to visualization properties.
-        """
         properties = {
             #"in_building": {"label": "In Building", "color": "darkred", "alpha": 0.8},
             "open_space": {"label": "Open Space", "color": "lightgray", "alpha": 0.1},
