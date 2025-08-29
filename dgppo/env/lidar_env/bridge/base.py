@@ -28,7 +28,9 @@ class LidarEnvState(NamedTuple):
     
     bearing: Float[Array, "n_agent"]
     current_cluster_oh: Float[Array, "n_agent n_cluster"]
+    start_cluster_oh: Float[Array, "n_agent n_cluster"]
     next_cluster_oh: Float[Array, "n_agent n_cluster"]
+    next_cluster_bonus_awarded: jnp.ndarray
     
     bridge_center: Float[Array, "2"]
     bridge_length: float
@@ -92,12 +94,18 @@ class LidarEnv(MultiAgentEnv, ABC):
         "default_area_size": 1.5,
         "dist2goal": 0.01,
         "top_k_rays": 8,
+<<<<<<<< HEAD:dgppo/env/lidar_env/bridge/old_base.py
         "num_bridges": 1, # Default to 1 bridge - Important for this scenario
         "bridge_length_range": [0.5, 1.0],
         "bridge_gap_width_range": [0.2, 0.4],
         "bridge_wall_thickness_range": [0.05, 0.1],
         "open_space_goal_distance": 0.2, # Added parameter for open space goal placement
         "goal_offset_from_centroid": 0.0 
+========
+        "num_buildings": 1,
+        "building_width_range": [0.5, 0.8],
+        "building_dim_diff_range": [0.0, 0.25]
+>>>>>>>> ce78ed9b53bc927794476fae18b033d1f1998403:dgppo/env/lidar_env/building/base.py
     }
     
     ALL_POSSIBLE_REGION_NAMES = [
@@ -110,10 +118,16 @@ class LidarEnv(MultiAgentEnv, ABC):
     # CLUSTER_MAP now defines the canonical integer IDs for region types
     CLUSTER_MAP: Dict[str, int] = {
         "open_space": 0,
+<<<<<<<< HEAD:dgppo/env/lidar_env/bridge/old_base.py
         "approach_bridge_0": 1,
         "on_bridge_0": 2, 
         "exit_bridge_0": 3
         #"around_bridge_0": 4, # You may also have "start" or "cross_bridge_gap" - ensure consistency
+========
+        "along_wall": 1,
+        "past_building": 2,
+        "around_corner": 3
+>>>>>>>> ce78ed9b53bc927794476fae18b033d1f1998403:dgppo/env/lidar_env/building/base.py
     }
     
     # Define curriculum transitions as a Python list of string tuples (for human readability/initial setup)
@@ -161,6 +175,85 @@ class LidarEnv(MultiAgentEnv, ABC):
             self.CURRICULUM_TRANSITIONS_INT_IDS = jnp.array(allowed_id_transitions_list, dtype=jnp.int32)
         else:
             self.CURRICULUM_TRANSITIONS_INT_IDS = jnp.empty((0, 2), dtype=jnp.int32)
+<<<<<<<< HEAD:dgppo/env/lidar_env/bridge/old_base.py
+========
+            
+        default_building_params = [(
+            jnp.array([self.area_size / 2, self.area_size / 2]),
+            0.5, 0.5, 0.0
+        )]
+
+        self.associator = BehaviorBuildings(
+            buildings=default_building_params,
+            all_region_names=self.ALL_POSSIBLE_REGION_NAMES
+        )
+
+        # Directly store the consistent mappings from the associator
+        self._name_to_id = self.associator.region_name_to_id
+        self._id_to_name = self.associator.region_id_to_name
+        self.all_region_centroids_jax_array = self.associator.all_region_centroids_jax_array
+        
+        # Use the consistent mapping to prepare the curriculum
+        self._prepare_transition_centroids()
+
+        # Create the specific-to-specific transitions array using the consistent ID mapping
+        valid_transitions_list = []
+        for start_name, goal_names in self.VALID_GOAL_MAP.items():
+            if start_name in self._name_to_id:
+                start_id = self._name_to_id[start_name]
+                for goal_name in goal_names:
+                    if goal_name in self._name_to_id:
+                        goal_id = self._name_to_id[goal_name]
+                        # Exclude transitions involving open_space
+                        if start_id != self._name_to_id["open_space"] and goal_id != self._name_to_id["open_space"]:
+                            valid_transitions_list.append((start_id, goal_id))
+        
+        # Store the specific-to-specific transitions for the reset function
+        self.VALID_TRANSITIONS_INT_IDS = jnp.array(valid_transitions_list, dtype=jnp.int32)
+        # jd.print("valid trans: {}", self.VALID_TRANSITIONS_INT_IDS)
+        # Also create a mapping from specific to general IDs
+        sorted_unique_names = self.ALL_POSSIBLE_REGION_NAMES #sorted(list(self._name_to_id.keys()))
+        # jd.print("associatr labels: {}", self.associator.sorted_region_names)
+        # jd.print("labels: {}", sorted_unique_names)
+        self._specific_id_to_general_id = jnp.array([
+            self.CLUSTER_MAP.get(self._SPECIFIC_TO_GENERAL_MAP.get(name)) for name in sorted_unique_names
+        ], dtype=jnp.int32)
+        
+    # In your LidarEnv class
+
+    def _prepare_transition_centroids(self):
+        # This method is called from __init__
+        valid_transitions_list = []
+        
+        for start_name, goal_names in self.VALID_GOAL_MAP.items():
+            if start_name in self._name_to_id:
+                start_id = self._name_to_id[start_name]
+                for goal_name in goal_names:
+                    if goal_name in self._name_to_id:
+                        goal_id = self._name_to_id[goal_name]
+                        
+                        # Look up the centroids using the consistent ID-to-centroid mapping
+                        start_centroid = self.associator.all_region_centroids_jax_array[start_id]
+                        goal_centroid = self.associator.all_region_centroids_jax_array[goal_id]
+
+                        # Store the centroids as a pair
+                        valid_transitions_list.append((start_centroid, goal_centroid))
+
+        # Convert the list to a JAX array
+        self.all_region_centroid_pairs_jax_array = jnp.array(valid_transitions_list)
+
+    def _get_valid_transitions_as_ids(self):
+        valid_transitions = []
+        for start_specific, goals_specific in self.VALID_GOAL_MAP.items():
+            if start_specific in self._name_to_id:
+                start_id = self._name_to_id[start_specific]
+                for goal_specific in goals_specific:
+                    if goal_specific in self._name_to_id:
+                        goal_id = self._name_to_id[goal_specific]
+                        if start_id != self._name_to_id["open_space"] and goal_id != self._name_to_id["open_space"]:
+                            valid_transitions.append((start_id, goal_id))
+        return jnp.array(valid_transitions, dtype=jnp.int32)
+>>>>>>>> ce78ed9b53bc927794476fae18b033d1f1998403:dgppo/env/lidar_env/building/base.py
         
     @property
     def state_dim(self) -> int:
@@ -198,6 +291,7 @@ class LidarEnv(MultiAgentEnv, ABC):
         self,
         key: PRNGKey,
         current_clusters: Optional[Array] = None,
+        start_clusters: Optional[Array] = None,
         next_clusters: Optional[Array] = None,
         custom_obstacles: Optional[Tuple[Array, Array, Array, Array]] = None,
         transition_index: Optional[int] = None # This is now ONLY for starting a specific episode
@@ -205,6 +299,8 @@ class LidarEnv(MultiAgentEnv, ABC):
     
         if current_clusters is None:
             current_clusters = jnp.zeros((self.num_agents, self.n_cluster), dtype=jnp.float32)
+        if start_clusters is None:
+            start_clusters = jnp.zeros((self.num_agents, self.n_cluster), dtype=jnp.float32)
         if next_clusters is None:
             next_clusters = jnp.zeros((self.num_agents, self.n_cluster), dtype=jnp.float32)
 
@@ -213,6 +309,7 @@ class LidarEnv(MultiAgentEnv, ABC):
         all_obs_len_y_list: List[jnp.ndarray] = []
         all_obs_theta_list: List[jnp.ndarray] = []
 
+<<<<<<<< HEAD:dgppo/env/lidar_env/bridge/old_base.py
         bridge_center_env_state: Float[Array, "2"] = jnp.array([0.0, 0.0])
         bridge_length_env_state: Float[Array, ""] = jnp.array(0.0)
         bridge_gap_width_env_state: Float[Array, ""] = jnp.array(0.0)
@@ -234,6 +331,14 @@ class LidarEnv(MultiAgentEnv, ABC):
             # jd.print("current index {}", current_region_id_tracer)
             # jd.print("next index {}", next_region_id_tracer)
             
+========
+        building_center_env_state: Float[Array, "2"] = jnp.array([0.0, 0.0])
+        building_width_env_state: Float[Array, ""] = jnp.array(0.0)
+        building_height_env_state: Float[Array, ""] = jnp.array(0.0)
+        building_theta_env_state: Float[Array, ""] = jnp.array(0.0)
+        initial_bonus_awarded = jnp.zeros(self.num_agents, dtype=jnp.bool_)
+        
+>>>>>>>> ce78ed9b53bc927794476fae18b033d1f1998403:dgppo/env/lidar_env/building/base.py
         if custom_obstacles is not None:
             obs_pos, obs_len_x, obs_len_y, obs_theta = custom_obstacles
             all_obs_pos_list.append(obs_pos)
@@ -367,12 +472,54 @@ class LidarEnv(MultiAgentEnv, ABC):
                 bridges=bridges_for_associator,
                 all_region_names=self.ALL_POSSIBLE_REGION_NAMES
             )
+<<<<<<<< HEAD:dgppo/env/lidar_env/bridge/old_base.py
 
 
+========
+        
+            # --- START OF NEW/CORRECTED LOGIC ---
+            # 1. Dynamically create the valid transitions list for this episode
+            valid_transitions_list = []
+            for start_name, goal_names in self.VALID_GOAL_MAP.items():
+                if start_name in associator.region_name_to_id:
+                    start_id = associator.region_name_to_id[start_name]
+                    for goal_name in goal_names:
+                        if goal_name in associator.region_name_to_id:
+                            goal_id = associator.region_name_to_id[goal_name]
+                            valid_transitions_list.append((start_id, goal_id))
+            
+            # 2. Convert the list of IDs into a JAX array
+            VALID_TRANSITIONS_INT_IDS_local = jnp.array(valid_transitions_list)
+            
+            # 3. Select a random transition ID pair from the dynamically created array
+            key_select, key_loop = jr.split(key, 2)
+            transition_idx = jr.choice(key_select, jnp.arange(VALID_TRANSITIONS_INT_IDS_local.shape[0]))
+            start_specific_id, goal_specific_id = VALID_TRANSITIONS_INT_IDS_local[transition_idx]
+            
+            # 4. Use the specific IDs to get the correct centroids for this episode
+            initial_pos = associator.all_region_centroids_jax_array[start_specific_id]
+            goal_pos = associator.all_region_centroids_jax_array[goal_specific_id]
+            
+            jd.print("regions: {}", associator.sorted_region_names)
+            
+            # 5. Get the general cluster IDs for one-hot encoding
+            current_cluster_id = jnp.squeeze(associator.get_current_behavior(initial_pos)) #self._specific_id_to_general_id[start_specific_id]
+            start_cluster_id = start_specific_id
+            next_cluster_id = goal_specific_id #self._specific_id_to_general_id[goal_specific_id]
+            # jd.print("Start specific:{}", start_specific_id)
+            # jd.print("Goal specific:{}", goal_specific_id)
+            # jd.print("Current cluster:{}", current_cluster_id)
+            # jd.print("Next cluster:{}", next_cluster_id)
+            
+            key = key_loop
+            
+            # Loop to create states for each agent
+>>>>>>>> ce78ed9b53bc927794476fae18b033d1f1998403:dgppo/env/lidar_env/building/base.py
             agent_states_list = []
             goal_states_list = []
             bearings_list = []
             current_clusters_oh_list = []
+            start_clusters_oh_list = []
             next_clusters_oh_list = []
 
             # Get the ID for "open_space"
@@ -401,17 +548,31 @@ class LidarEnv(MultiAgentEnv, ABC):
                 key_agent_pos, key_goal_pos, key_rot, key_loop = jr.split(key, 4)
                 key = key_loop
 
+<<<<<<<< HEAD:dgppo/env/lidar_env/bridge/old_base.py
                 # 1. Sample initial position from the selected 'current_region_id' (NOISE REMOVED)
                 initial_pos_candidate = associator.get_region_centroid(current_region_id_tracer)
+========
+                # The positions are already JAX-compatible; no need to re-calculate.
+                # Only add a small random offset if desired.
+                initial_pos_agent = initial_pos + jr.normal(key_agent_pos, (2,)) * 0.025
+                goal_pos_agent = goal_pos + jr.normal(key_goal_pos, (2,)) * 0.025
+>>>>>>>> ce78ed9b53bc927794476fae18b033d1f1998403:dgppo/env/lidar_env/building/base.py
                 
                 # Check for nan values (this must be JAX-compatible)
                 initial_pos = jnp.where(jnp.isnan(initial_pos_candidate).any(), 
                                         jnp.zeros(2), # Default if NaN
                                         initial_pos_candidate)
                 
+<<<<<<<< HEAD:dgppo/env/lidar_env/bridge/old_base.py
                 # NOISE REMOVED: No perturbation around the centroid for initial_pos
                 initial_pos = initial_pos + jr.normal(key_agent_pos, (2,)) * 0.05
                 initial_pos = jnp.clip(initial_pos, 0, self.area_size)
+========
+                # Use the consistent IDs for one-hot encoding
+                current_cluster_oh = jax.nn.one_hot(current_cluster_id, self.n_cluster)
+                start_cluster_oh = jax.nn.one_hot(start_cluster_id, self.n_cluster)
+                next_cluster_oh = jax.nn.one_hot(next_cluster_id, self.n_cluster)
+>>>>>>>> ce78ed9b53bc927794476fae18b033d1f1998403:dgppo/env/lidar_env/building/base.py
 
                 # 2. Sample goal position from the selected 'next_region_id' (SPECIAL HANDLING FOR OPEN SPACE)
                 goal_pos_candidate = associator.get_region_centroid(next_region_id_tracer)
@@ -470,12 +631,21 @@ class LidarEnv(MultiAgentEnv, ABC):
                 goal_states_list.append(jnp.array([goal_pos[0], goal_pos[1], 0.0, 0.0]))
                 bearings_list.append(bearing)
                 current_clusters_oh_list.append(current_cluster_oh)
+                start_clusters_oh_list.append(start_cluster_oh)
                 next_clusters_oh_list.append(next_cluster_oh)
+<<<<<<<< HEAD:dgppo/env/lidar_env/bridge/old_base.py
             
+========
+                
+>>>>>>>> ce78ed9b53bc927794476fae18b033d1f1998403:dgppo/env/lidar_env/building/base.py
             states = jnp.stack(agent_states_list)
             goals = jnp.stack(goal_states_list)
             bearing = jnp.stack(bearings_list)
             current_clusters = jnp.stack(current_clusters_oh_list)
+<<<<<<<< HEAD:dgppo/env/lidar_env/bridge/old_base.py
+========
+            start_clusters = jnp.stack(start_clusters_oh_list)
+>>>>>>>> ce78ed9b53bc927794476fae18b033d1f1998403:dgppo/env/lidar_env/building/base.py
             next_clusters = jnp.stack(next_clusters_oh_list)
 
         else: # Fallback if no bridges are generated or BehaviorAssociator not used
@@ -504,12 +674,21 @@ class LidarEnv(MultiAgentEnv, ABC):
             obstacle=obstacles,
             bearing=bearing, 
             current_cluster_oh=current_clusters,
+            start_cluster_oh=start_clusters,
             next_cluster_oh=next_clusters,
+<<<<<<<< HEAD:dgppo/env/lidar_env/bridge/old_base.py
             bridge_center=bridge_center_env_state,
             bridge_length=bridge_length_env_state,
             bridge_gap_width=bridge_gap_width_env_state,
             bridge_wall_thickness=bridge_wall_thickness_env_state,
             bridge_theta=bridge_theta_env_state,
+========
+            next_cluster_bonus_awarded=initial_bonus_awarded,
+            building_center=building_center_env_state,
+            building_width=building_width_env_state,
+            building_height=building_height_env_state,
+            building_theta=building_theta_env_state,
+>>>>>>>> ce78ed9b53bc927794476fae18b033d1f1998403:dgppo/env/lidar_env/building/base.py
         )
 
         lidar_data = self.get_lidar_data(states, obstacles)
@@ -548,6 +727,7 @@ class LidarEnv(MultiAgentEnv, ABC):
         agent_base_states = graph.env_states.agent # Get the underlying agent state from env_states
         goals = graph.env_states.goal
         obstacles = graph.env_states.obstacle
+<<<<<<<< HEAD:dgppo/env/lidar_env/bridge/old_base.py
 
         # Also pass through the bearing and cluster info from the previous step's env_states
         bearing = graph.env_states.bearing
@@ -561,37 +741,76 @@ class LidarEnv(MultiAgentEnv, ABC):
         bridge_gap_width = graph.env_states.bridge_gap_width
         bridge_wall_thickness = graph.env_states.bridge_wall_thickness
         bridge_theta = graph.env_states.bridge_theta
+========
+        
+        # Pass building parameters through instead of bridge parameters
+        building_center = graph.env_states.building_center
+        building_width = graph.env_states.building_width
+        building_height = graph.env_states.building_height
+        building_theta = graph.env_states.building_theta
+        
+        building_params = [(
+                building_center, 
+                building_width, 
+                building_height, 
+                building_theta
+            )]
+
+        # Also pass through the bearing and cluster info from the previous step's env_states
+        bearing = graph.env_states.bearing
+        from dgppo.env.building_behavior_associator import BehaviorBuildings
+        associator = BehaviorBuildings(
+            buildings=building_params,
+            all_region_names=self.ALL_POSSIBLE_REGION_NAMES
+        )
+        current_id = jax_vmap(associator.get_current_behavior)(agent_base_states[:, :2])
+        current_cluster_oh = jax.nn.one_hot(current_id, self.n_cluster)
+        start_cluster_oh = graph.env_states.start_cluster_oh
+        next_cluster_oh = graph.env_states.next_cluster_oh
+>>>>>>>> ce78ed9b53bc927794476fae18b033d1f1998403:dgppo/env/lidar_env/building/base.py
 
         # calculate next states
         action = self.clip_action(action)
         next_agent_base_states = self.agent_step_euler(agent_base_states, action) # Only update (x,y,vx,vy)
         #jd.print("Action: {}", action)
 
+<<<<<<<< HEAD:dgppo/env/lidar_env/bridge/old_base.py
         # Reconstruct the next LidarEnvState
+========
+        # compute reward and cost
+        reward, bonus_awarded_updated = self.get_reward(graph, action)
+        cost = self.get_cost(graph)
+        assert reward.shape == tuple()
+        
+        # Reconstruct the next LidarBuildingsState
+>>>>>>>> ce78ed9b53bc927794476fae18b033d1f1998403:dgppo/env/lidar_env/building/base.py
         next_env_state = LidarEnvState(
             next_agent_base_states, 
             goals, 
             obstacles,
             bearing, # Bearing and clusters are usually static for a rollout or updated by a separate logic
             current_cluster_oh,
+            start_cluster_oh,
             next_cluster_oh,
+<<<<<<<< HEAD:dgppo/env/lidar_env/bridge/old_base.py
             bridge_center,
             bridge_length,
             bridge_gap_width,
             bridge_wall_thickness,
             bridge_theta,
+========
+            bonus_awarded_updated,
+            # Pack the building parameters into the new state
+            building_center=building_center,
+            building_width=building_width,
+            building_height=building_height,
+            building_theta=building_theta,
+>>>>>>>> ce78ed9b53bc927794476fae18b033d1f1998403:dgppo/env/lidar_env/building/base.py
         )
         
         lidar_data_next = self.get_lidar_data(next_agent_base_states, obstacles)
         info = {}
-
-        # the episode ends when reaching max_episode_steps
         done = jnp.array(False)
-
-        # compute reward and cost
-        reward = self.get_reward(graph, action)
-        cost = self.get_cost(graph)
-        assert reward.shape == tuple()
 
         return self.get_graph(next_env_state, lidar_data_next), reward, cost, done, info
 
@@ -637,6 +856,7 @@ class LidarEnv(MultiAgentEnv, ABC):
             dpi: int = 100,
             **kwargs
     ) -> None:
+<<<<<<<< HEAD:dgppo/env/lidar_env/bridge/old_base.py
         from dgppo.env.plot import render_lidar 
 
         # Extract bridge parameters from the first frame's env_states in the rollout
@@ -648,6 +868,15 @@ class LidarEnv(MultiAgentEnv, ABC):
             "bridge_gap_width": first_env_state.bridge_gap_width,
             "bridge_wall_thickness": first_env_state.bridge_wall_thickness,
             "bridge_theta": first_env_state.bridge_theta,
+========
+        
+        first_env_state = rollout.graph.env_states
+        building_params_for_render = {
+            "building_center": first_env_state.building_center,
+            "building_width": first_env_state.building_width,
+            "building_height": first_env_state.building_height,
+            "building_theta": first_env_state.building_theta,
+>>>>>>>> ce78ed9b53bc927794476fae18b033d1f1998403:dgppo/env/lidar_env/building/base.py
         }
 
 
@@ -674,64 +903,68 @@ class LidarEnv(MultiAgentEnv, ABC):
         pass
 
     def get_graph(self, state: LidarEnvState, lidar_data: Pos2d = None) -> GraphsTuple:
-        n_hits = 8 #self._params["top_k_rays"] * self.num_agents if (self.params["n_obs"] > 0 or self.params["num_bridges"] > 0 or self.params["num_buildings"] > 0) else 0
+        n_hits = 8  
         n_nodes = self.num_agents + self.num_goals + n_hits
 
         if lidar_data is not None:
             lidar_data = merge01(lidar_data)
-        elif n_hits > 0: # Ensure lidar_data is at least zeros if hits are expected but it's None
+        elif n_hits > 0:
             lidar_data = jnp.zeros((n_hits, 2), dtype=jnp.float32)
 
-        # node features: (x, y, vx, vy, bearing, current_cluster_oh (N_cluster), next_cluster_oh (N_cluster), is_obs, is_goal, is_agent)
+        # Node features: (x, y, vx, vy, bearing, current_cluster_oh, start_cluster_oh, next_cluster_oh, is_obs, is_goal, is_agent)
         node_feats = jnp.zeros((n_nodes, self.node_dim), dtype=jnp.float32)
-        
-        # Agent features: [x, y, vx, vy, bearing, current_cluster_oh, next_cluster_oh, is_obs=0, is_goal=0, is_agent=1]
+
         agent_start_idx = 0
-        # Base state (x,y,vx,vy)
-        node_feats = node_feats.at[agent_start_idx : agent_start_idx + self.num_agents, :self.state_dim].set(state.agent)
+        # Base state
+        node_feats = node_feats.at[agent_start_idx:agent_start_idx+self.num_agents, :self.state_dim].set(state.agent)
         # Bearing
-        node_feats = node_feats.at[agent_start_idx : agent_start_idx + self.num_agents, self.state_dim].set(state.bearing)
-        # Current cluster one-hot
-        node_feats = node_feats.at[agent_start_idx : agent_start_idx + self.num_agents, self.state_dim + self.bearing_dim : self.state_dim + self.bearing_dim + self.n_cluster].set(state.current_cluster_oh)
-        # Next cluster one-hot
-        node_feats = node_feats.at[agent_start_idx : agent_start_idx + self.num_agents, self.state_dim + self.bearing_dim + self.n_cluster : self.state_dim + self.bearing_dim + 2 * self.n_cluster].set(state.next_cluster_oh)
-        # Is agent indicator (last of the 3 indicator bits)
-        node_feats = node_feats.at[agent_start_idx : agent_start_idx + self.num_agents, self.state_dim + self.bearing_dim + 2 * self.n_cluster + 2].set(1.) 
+        node_feats = node_feats.at[agent_start_idx:agent_start_idx+self.num_agents, self.state_dim].set(state.bearing)
+        # Current cluster
+        node_feats = node_feats.at[agent_start_idx:agent_start_idx+self.num_agents, self.state_dim+self.bearing_dim:self.state_dim+self.bearing_dim+self.n_cluster].set(state.current_cluster_oh)
+        # Start cluster
+        node_feats = node_feats.at[agent_start_idx:agent_start_idx+self.num_agents, self.state_dim+self.bearing_dim+self.n_cluster:self.state_dim+self.bearing_dim+2*self.n_cluster].set(state.start_cluster_oh)
+        # Next cluster
+        #node_feats = node_feats.at[agent_start_idx:agent_start_idx+self.num_agents, self.state_dim+self.bearing_dim+2*self.n_cluster:self.state_dim+self.bearing_dim+3*self.n_cluster].set(state.next_cluster_oh)
+        # Is agent indicator (last of 3)
+        node_feats = node_feats.at[agent_start_idx:agent_start_idx+self.num_agents, self.state_dim+self.bearing_dim+2*self.n_cluster+2].set(1.0)
 
-        # Goal features: [x, y, vx, vy, 0, 0...0, 0...0, is_obs=0, is_goal=1, is_agent=0]
+        # Goal features
         goal_start_idx = self.num_agents
-        node_feats = node_feats.at[goal_start_idx : goal_start_idx + self.num_goals, :self.state_dim].set(state.goal)
-        # Is goal indicator (middle of the 3 indicator bits)
-        node_feats = node_feats.at[goal_start_idx : goal_start_idx + self.num_goals, self.state_dim + self.bearing_dim + 2 * self.n_cluster + 1].set(1.) 
+        node_feats = node_feats.at[goal_start_idx:goal_start_idx+self.num_goals, :self.state_dim].set(state.goal)
+        # Is goal indicator (middle)
+        node_feats = node_feats.at[goal_start_idx:goal_start_idx+self.num_goals, self.state_dim+self.bearing_dim+2*self.n_cluster+1].set(1.0)
 
-        # Obstacle (lidar hit) features: [x, y, 0, 0, 0, 0...0, 0...0, is_obs=1, is_goal=0, is_agent=0]
+        # Obstacle (lidar hits)
         if n_hits > 0 and lidar_data is not None:
             obs_start_idx = self.num_agents + self.num_goals
-            node_feats = node_feats.at[obs_start_idx : obs_start_idx + n_hits, :2].set(lidar_data) # Only x, y
-            # Is obs indicator (first of the 3 indicator bits)
-            node_feats = node_feats.at[obs_start_idx : obs_start_idx + n_hits, self.state_dim + self.bearing_dim + 2 * self.n_cluster].set(1.) 
+            node_feats = node_feats.at[obs_start_idx:obs_start_idx+n_hits, :2].set(lidar_data)
+            # Is obs indicator (first)
+            node_feats = node_feats.at[obs_start_idx:obs_start_idx+n_hits, self.state_dim+self.bearing_dim+2*self.n_cluster].set(1.0)
 
+        # Node types
         node_type = -jnp.ones(n_nodes, dtype=jnp.int32)
-        node_type = node_type.at[: self.num_agents].set(LidarEnv.AGENT)
-        node_type = node_type.at[self.num_agents: self.num_agents + self.num_goals].set(LidarEnv.GOAL)
+        node_type = node_type.at[:self.num_agents].set(LidarEnv.AGENT)
+        node_type = node_type.at[self.num_agents:self.num_agents+self.num_goals].set(LidarEnv.GOAL)
         if n_hits > 0:
-            node_type = node_type.at[self.num_agents + self.num_goals:].set(LidarEnv.OBS)
+            node_type = node_type.at[self.num_agents+self.num_goals:].set(LidarEnv.OBS)
 
         edge_blocks = self.edge_blocks(state, lidar_data)
 
+        # Raw states
         raw_states = jnp.concatenate([state.agent, state.goal], axis=0)
         if lidar_data is not None:
-            # Pad lidar data to match state_dim (x,y,0,0) before concatenating
             lidar_states_padded = jnp.concatenate(
-                [lidar_data, jnp.zeros((n_hits, self.state_dim - lidar_data.shape[1]), dtype=lidar_data.dtype)], axis=1)
+                [lidar_data, jnp.zeros((n_hits, self.state_dim - 2), dtype=lidar_data.dtype)],
+                axis=1
+            )
             raw_states = jnp.concatenate([raw_states, lidar_states_padded], axis=0)
-            
+
         return GetGraph(
             nodes=node_feats,
             node_type=node_type,
             edge_blocks=edge_blocks,
-            env_states=state, # Pass the full LidarEnvState
-            states=raw_states # This is the raw state array, not the extended node_feats
+            env_states=state,
+            states=raw_states
         ).to_padded()
     
     def state_lim(self, state: Optional[State] = None) -> Tuple[State, State]:
