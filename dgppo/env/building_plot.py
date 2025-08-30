@@ -21,7 +21,7 @@ from ..trainer.utils import centered_norm
 from ..utils.typing import EdgeIndex, Pos2d, Pos3d, Array
 from ..utils.utils import merge01, tree_index, MutablePatchCollection, save_anim
 from dgppo.env.obstacle import Cuboid, Sphere, Obstacle, Rectangle
-from dgppo.env.intersection_behavior_associator import BehaviorIntersection
+from dgppo.env.building_behavior_associator import BehaviorBuildings
 
 ALL_POSSIBLE_REGION_NAMES = [
         "open_space",
@@ -472,8 +472,6 @@ def render_mpe(
     ani = FuncAnimation(fig, update, frames=anim_T, init_func=init_fn, interval=mspf, blit=True)
     save_anim(ani, video_path)
 
-
-
 def render_lidar(
     rollout: Rollout,
     video_path: pathlib.Path,
@@ -546,7 +544,10 @@ def render_lidar(
 
                 theta_val = np.asarray(first_env_state.obstacle.theta[i])
                 theta = float(theta_val[0]) if theta_val.ndim > 0 else float(theta_val)
-
+                
+                # --- NEW: Use a new tuple format for obstacles to avoid conflict with buildings/bridges ---
+                # A simple way is to pass the Rectangle object itself if the behavior associator can handle it,
+                # or a simple tuple like this. Assuming the latter.
                 obstacles_for_associator.append(("rect", (center_x, center_y, length_x, length_y, theta)))
         
         elif isinstance(first_env_state.obstacle, Sphere):
@@ -555,7 +556,7 @@ def render_lidar(
                 radius = float(first_env_state.obstacle.radius[i].item()) if hasattr(first_env_state.obstacle.radius[i], 'item') else float(first_env_state.obstacle.radius[i])
                 obstacles_for_associator.append(("circle", (center_x, center_y, radius)))
 
-    behavior_associator = BehaviorIntersection(
+    behavior_associator = BehaviorBuildings(
         buildings=buildings_for_associator,
         all_region_names=ALL_POSSIBLE_REGION_NAMES,
         obstacles=obstacles_for_associator

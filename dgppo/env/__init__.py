@@ -4,7 +4,7 @@ from .base import MultiAgentEnv
 from dgppo.env.mpe import MPETarget, MPESpread, MPELine, MPEFormation, MPECorridor, MPEConnectSpread
 from dgppo.env.lidar_env import LidarSpread, LidarTarget, LidarLine #, LidarBicycleTarget
 from dgppo.env.vmas import VMASWheel, VMASReverseTransport
-
+import jax
 
 ENV = {
 
@@ -27,6 +27,7 @@ DEFAULT_MAX_STEP = 128
 
 
 def make_env(
+        #key: jax.Array,
         env_id: str,
         num_agents: int,
         max_step: int = None,
@@ -45,6 +46,7 @@ def make_env(
         area_size = params['default_area_size']
         params['comm_radius'] = area_size * 10
     return ENV[env_id](
+        #key=key,
         num_agents=num_agents,
         area_size=None,
         max_step=max_step,

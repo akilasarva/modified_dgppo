@@ -9,10 +9,10 @@ import jax
 from dgppo.env.behavior_associator import BehaviorAssociator
 
 class BehaviorBridge(BehaviorAssociator):
-    def __init__(self, bridges: List, buildings: List = [], obstacles: List = [], all_region_names: List[str] = []):
+    def __init__(self, bridges: List, buildings: List = [], intersections: List = [], obstacles: List = [], all_region_names: List[str] = []):
         if not bridges:
             raise ValueError("BehaviorBridge requires at least one bridge.")
-        super().__init__(bridges, buildings, obstacles, all_region_names)
+        super().__init__(bridges, buildings, intersections, obstacles, all_region_names)
 
     def _get_rectangle_corners_np(self, center, length, width, angle_rad):
         half_l = length / 2.0

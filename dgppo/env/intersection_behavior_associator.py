@@ -1,163 +1,218 @@
 import jax.numpy as jnp
 import numpy as np
-import matplotlib.pyplot as plt
 from matplotlib.patches import Polygon
 from typing import List, Tuple, Dict, Any
 from functools import partial
-import pathlib
-import jax.numpy as jnp
 import jax.random as jr
-import numpy as np # Keep if needed for other non-JAX ops, but avoid for JAX arrays
-import functools as ft
 import jax
 import jax.debug as jd
+import jax.lax as lax
+from jax.lax import cond
 
-# You must import the base BehaviorAssociator class
 from dgppo.env.behavior_associator import BehaviorAssociator
 
 class BehaviorIntersection(BehaviorAssociator):
-    def __init__(self, intersections: List, bridges: List = [], buildings: List = [], obstacles: List = [], all_region_names = []):
-        if not intersections:
-            raise ValueError("BehaviorIntersection requires at least one intersection.")
-        all_region_names = ["open_space", "in_intersection"]
-        passages = ["0", "1", "2", "3"]
-        for p in passages:
-            all_region_names.append(f"passage_{p}_enter")
-            all_region_names.append(f"passage_{p}_exit")
-        super().__init__(intersections, bridges, buildings, obstacles, all_region_names)
+    def __init__(self, key: jr.PRNGKey, is_four_way: bool, intersection_params: Dict, obstacles: List = [], all_region_names: List[str] = [], params=None, area_size=None):
+        self.key = key
+        self.params = params if params is not None else {}
+        self.all_region_names = all_region_names
+        self.area_size = area_size
+        self.obstacles = obstacles
+        self.is_four_way = is_four_way
+        self.intersection_params = intersection_params
+        
+        # Conditionally determine `self.is_four_way` based on the input argument
+        if is_four_way is None:
+            key_is_four_way, self.key = jax.random.split(self.key)
+            is_four_way_p = self.params.get('is_four_way_p', 0.5)
+            self.is_four_way = bool(jax.random.uniform(key_is_four_way) < is_four_way_p)
+        else:
+            self.is_four_way = is_four_way
 
-    def _get_rectangle_corners_np(self, center, length, width, angle_rad):
-        half_l = length / 2.0
-        half_w = width / 2.0
-        cos_a = np.cos(angle_rad)
-        sin_a = np.sin(angle_rad)
+        # Conditionally determine `self.intersection_params` based on the input argument
+        if intersection_params is None:
+            if self.area_size is None:
+                raise ValueError("area_size must be provided to randomly generate intersection parameters.")
+                
+            key_intersection, self.key = jax.random.split(self.key)
+            key_center, key_size = jax.random.split(key_intersection)
+            
+            self.intersection_params = {
+                'center': jax.random.uniform(key_center, shape=(2,), minval=-self.area_size / 2, maxval=self.area_size / 2),
+                'size': jax.random.uniform(key_size, shape=(), minval=5.0, maxval=10.0),
+                'passage_min': 0.25,  # Example default value, adjust as needed
+                'passage_max': 0.5,  # Example default value, adjust as needed
+                'obs_len_min': 0.4, # Example default value, adjust as needed
+                'obs_len_max': 0.75, # Example default value, adjust as needed
+            }
+        else:
+            self.intersection_params = intersection_params
 
-        local_corners = np.array([
-            [-half_l, -half_w],
-            [half_l, -half_w],
-            [half_l, half_w],
-            [-half_l, half_w]
-        ])
+        # Generate region names based on the determined `self.is_four_way`
+        num_passages = 4 if self.is_four_way else 3
+        self.all_region_names = ["open_space", "in_intersection"]
+        
+        for i in range(num_passages):
+            self.all_region_names.append(f"passage_{i}_enter")
+            self.all_region_names.append(f"passage_{i}_exit")
 
-        rotation_matrix = np.array([
-            [cos_a, -sin_a],
-            [sin_a, cos_a]
-        ])
-
-        rotated_corners = np.dot(local_corners, rotation_matrix.T)
-        final_corners = rotated_corners + center
-        return final_corners
-
+        super().__init__(
+            key=self.key,
+            all_region_names=self.all_region_names,
+            area_size=self.area_size,
+            **self.params
+        )
+    
     def _define_behavior_regions(self):
+        """
+        Defines the polygonal regions of the intersection using JAX.
+        This function is designed to be pure and JIT-compatible.
+        """
+        key, subkey_center, subkey_angle, subkey_dims = jr.split(self.key, 4)
+
         regions = {}
         regions["open_space"] = jnp.array([(0, 0), (50, 0), (50, 50), (0, 50)], dtype=jnp.float32)
 
-        # 1. Randomly generate parameters for 4 obstacles
-        self.key, subkey = jr.split(self.key)
-        rand_params = jr.uniform(subkey, shape=(4, 5), minval=jnp.array([10, 10, 15, 9, 0]), maxval=jnp.array([20, 20, 25, 12, 360]))
-
-        # Define obstacle centers relative to grid corners
-        centers = jnp.array([
-            [rand_params[0, 0], rand_params[0, 1]],  # top_left
-            [50 - rand_params[1, 0], rand_params[1, 1]], # top_right
-            [50 - rand_params[2, 0], 50 - rand_params[2, 1]], # bottom_right
-            [rand_params[3, 0], 50 - rand_params[3, 1]], # bottom_left
-        ])
+        # Randomly determine the center, rotation, and dimensions of the intersection
+        center = jr.uniform(subkey_center, shape=(2,), minval=15.0, maxval=35.0)
+        global_angle = jr.uniform(subkey_angle, shape=(), minval=0.0, maxval=2 * jnp.pi)
         
-        # Adjust angles to keep them pointing towards the center
-        angles = jnp.array([
-            rand_params[0, 4] % 90,
-            (rand_params[1, 4] % 90) + 90,
-            (rand_params[2, 4] % 90) + 180,
-            (rand_params[3, 4] % 90) + 270,
-        ])
-
-        self.obstacles_def = {}
-        all_intersection_corners = []
-        corner_names = ["top_left", "top_right", "bottom_right", "bottom_left"]
-        for i in range(4):
-            center = centers[i]
-            length = rand_params[i, 2]
-            width = rand_params[i, 3]
-            angle = angles[i]
-            self.obstacles_def[corner_names[i]] = {"center": center, "size": (length, width), "angle": angle}
-
-            rad = np.radians(angle)
-            corners = self._get_rectangle_corners_np(center, length, width, rad)
-            all_intersection_corners.append(jnp.asarray(corners, dtype=jnp.float32))
-
-        # 2. Define the IN INTERSECTION (ORANGE) polygon
-        inner_corners_points = jnp.array([
-            all_intersection_corners[0][2], # Top-left obstacle's bottom-right corner
-            all_intersection_corners[1][3], # Top-right obstacle's bottom-left corner
-            all_intersection_corners[2][0], # Bottom-right obstacle's top-left corner
-            all_intersection_corners[3][1]  # Bottom-left obstacle's top-right corner
-        ])
+        passage_width = jr.uniform(subkey_dims, minval=self.intersection_params["passage_min"], maxval=self.intersection_params["passage_max"])
+        obs_len = jr.uniform(subkey_dims, shape=(), minval=self.intersection_params["obs_len_min"], maxval=self.intersection_params["obs_len_max"])
         
-        regions["in_intersection"] = inner_corners_points
-
-        # 3. Define the ELLIPTICAL passage regions
-        passages_def = {
-            "0": (all_intersection_corners[0][2], all_intersection_corners[1][3]),
-            "1": (all_intersection_corners[1][2], all_intersection_corners[2][1]),
-            "2": (all_intersection_corners[2][2], all_intersection_corners[3][1]),
-            "3": (all_intersection_corners[3][2], all_intersection_corners[0][1]),
-        }
+        half_gap = passage_width / 2.0
         
-        for name, (p1, p2) in passages_def.items():
-            regions[f"passage_{name}_enter"] = self._create_elliptical_region(p1, p2)
-            regions[f"passage_{name}_exit"] = self._create_elliptical_region(p1, p2)
+        if self.is_four_way:
+            # Vertices of the inner intersection square, relative to a (0,0) center.
+            inner_corners_local = jnp.array([
+                [-half_gap, -half_gap],
+                [half_gap, -half_gap],
+                [half_gap, half_gap],
+                [-half_gap, half_gap]
+            ])
             
-        return regions
-    
-    def _create_elliptical_region(self, p1: jnp.ndarray, p2: jnp.ndarray):
-        center = (p1 + p2) / 2.0
-        major_axis = jnp.linalg.norm(p1 - p2)
-        minor_axis = major_axis * 0.5 
-        angle_rad = jnp.arctan2(p2[1] - p1[1], p2[0] - p1[0])
-        angle_deg = np.degrees(angle_rad)
+            # Rotation matrix for the global angle
+            cos_a, sin_a = jnp.cos(global_angle), jnp.sin(global_angle)
+            rotation_matrix = jnp.array([[cos_a, -sin_a], [sin_a, cos_a]])
+            
+            # Rotate and translate the central square
+            rotated_corners = jnp.einsum('ij,kj->ki', rotation_matrix, inner_corners_local)
+            regions["in_intersection"] = rotated_corners + center
+            
+            # Define and transform the passage regions (trapezoids)
+            passage_0_local = jnp.array([[-half_gap, half_gap], [half_gap, half_gap], [half_gap, 50], [-half_gap, 50]])
+            passage_1_local = jnp.array([[half_gap, -half_gap], [half_gap, half_gap], [50, half_gap], [50, -half_gap]])
+            passage_2_local = jnp.array([[-half_gap, -half_gap], [half_gap, -half_gap], [half_gap, -50], [-half_gap, -50]])
+            passage_3_local = jnp.array([[-half_gap, -half_gap], [-half_gap, half_gap], [-50, half_gap], [-50, -half_gap]])
 
-        return ("ellipse", (center[0], center[1], major_axis, minor_axis, angle_deg))
-    
+            rotated_passages = [
+                jnp.einsum('ij,kj->ki', rotation_matrix, p) + center for p in [
+                    passage_0_local, passage_1_local, passage_2_local, passage_3_local
+                ]
+            ]
+            regions["passage_0_enter"] = regions["passage_0_exit"] = rotated_passages[0]
+            regions["passage_1_enter"] = regions["passage_1_exit"] = rotated_passages[1]
+            regions["passage_2_enter"] = regions["passage_2_exit"] = rotated_passages[2]
+            regions["passage_3_enter"] = regions["passage_3_exit"] = rotated_passages[3]
+
+        else: # 3-way intersection
+            # Define the vertices for the central trapezoid, relative to a (0,0) center.
+            long_obs_len = obs_len + passage_width + obs_len
+            inner_corners_local = jnp.array([
+                [-long_obs_len / 2.0, obs_len / 2.0],  # Top-left vertex
+                [long_obs_len / 2.0, obs_len / 2.0],   # Top-right vertex
+                [half_gap, -obs_len / 2.0],              # Bottom-right vertex
+                [-half_gap, -obs_len / 2.0]               # Bottom-left vertex
+            ])
+
+            # Rotation matrix for the global angle
+            cos_a, sin_a = jnp.cos(global_angle), jnp.sin(global_angle)
+            rotation_matrix = jnp.array([[cos_a, -sin_a], [sin_a, cos_a]])
+
+            # Rotate and translate the central trapezoid
+            rotated_corners = jnp.einsum('ij,kj->ki', rotation_matrix, inner_corners_local)
+            regions["in_intersection"] = rotated_corners + center
+
+            # Define and transform the passage regions for the 3-way
+            passage_0_local = jnp.array([
+                [-half_gap, -obs_len / 2.0],
+                [half_gap, -obs_len / 2.0],
+                [half_gap, -50],
+                [-half_gap, -50]
+            ])
+            passage_1_local = jnp.array([
+                [-long_obs_len / 2.0, obs_len / 2.0],
+                [-50, 50],
+                [-50, obs_len / 2.0]
+            ])
+            passage_2_local = jnp.array([
+                [long_obs_len / 2.0, obs_len / 2.0],
+                [50, 50],
+                [50, obs_len / 2.0]
+            ])
+
+            rotated_passages = [
+                jnp.einsum('ij,kj->ki', rotation_matrix, p) + center for p in [
+                    passage_0_local, passage_1_local, passage_2_local
+                ]
+            ]
+            regions["passage_0_enter"] = regions["passage_0_exit"] = rotated_passages[0]
+            regions["passage_1_enter"] = regions["passage_1_exit"] = rotated_passages[1]
+            regions["passage_2_enter"] = regions["passage_2_exit"] = rotated_passages[2]
+
+        return regions
+
     def _get_region_visualization_properties(self) -> Dict[str, Dict[str, Any]]:
         properties = {
             "in_intersection": {"label": "Intersection", "color": "darkorange", "alpha": 0.8},
             "open_space": {"label": "Open Space", "color": "lightgray", "alpha": 0.1},
         }
-        passages = ["0", "1", "2", "3"]
-        for p in passages:
+        num_passages = 4 if self.is_four_way else 3
+        for p in range(num_passages):
             properties[f"passage_{p}_enter"] = {"label": f"Passage {p} Enter", "color": "lightblue", "alpha": 0.5}
             properties[f"passage_{p}_exit"] = {"label": f"Passage {p} Exit", "color": "lightgreen", "alpha": 0.5}
         return properties
 
-    # @partial(jax.jit, static_argnums=(0,))
-    # def get_region_centroid(self, region_id: jnp.ndarray):
-    #     centroid = self.all_region_centroids_jax_array[region_id]
-    #     return centroid
-    
     @partial(jax.jit, static_argnums=(0,))
     def get_region_centroid(self, region_id: jnp.ndarray):
-        """
-        Returns the centroid of a specified region, handling both polygons and ellipses.
-        """
-        # Get the name of the region from its ID
-        name = self.region_id_to_name[region_id]
-        
-        # Retrieve the data for the specified region
-        region_data = self.behavior_regions[name]
-        
-        # Check the type of the region using JAX-compatible logic
-        is_polygon = isinstance(region_data, jnp.ndarray) and region_data.ndim == 2
-        is_ellipse = isinstance(region_data, tuple) and region_data[0] == "ellipse"
-
-        # Define the centroid calculation functions for each type
-        def polygon_centroid():
-            return jnp.mean(region_data, axis=0)
-
-        def ellipse_centroid():
-            # The ellipse data tuple is ("ellipse", (center_x, center_y, ...))
-            return jnp.array([region_data[1][0], region_data[1][1]])
-
-        # Use jax.lax.cond to select the correct function based on the region type
-        centroid = jax.lax.cond(is_polygon, polygon_centroid, ellipse_centroid)
+        """Returns the centroid of a specified polygon region."""
+        # This will work because we are only using polygons now
+        centroid = jnp.mean(self.behavior_regions_jax_array[region_id], axis=0)
         return centroid
+        
+    @partial(jax.jit, static_argnums=(0,))
+    def get_current_behavior_direction(self, pos: jnp.ndarray, vel: jnp.ndarray) -> jnp.ndarray:
+        """
+        Determines the current region and categorizes enter/exit based on direction.
+        Args:
+            pos: Agent's position (2,)
+            vel: Agent's velocity (2,)
+        Returns:
+            The integer ID of the resolved behavioral region.
+        """
+        current_region_id = self.get_current_behavior(pos)
+        
+        in_intersection_id = self.region_name_to_id["in_intersection"]
+        centroid_in_intersection = self.get_region_centroid(in_intersection_id)
+        
+        vec_to_centroid = centroid_in_intersection - pos
+        dot_product = jnp.dot(vel, vec_to_centroid)
+        is_moving_towards = dot_product > 0.01 
+        
+        final_id = lax.cond(
+            current_region_id == in_intersection_id,
+            lambda: in_intersection_id,
+            lambda: lax.cond(
+                self.id_to_curriculum_prefix_map.get(current_region_id, "").startswith("passage_"),
+                lambda: self._get_enter_exit_id(current_region_id, is_moving_towards),
+                lambda: current_region_id
+            )
+        )
+        return final_id
+
+    def _get_enter_exit_id(self, passage_id, is_moving_towards):
+        base_name = self.id_to_curriculum_prefix_map.get(passage_id, "")
+        enter_id = self.region_name_to_id.get(base_name + "_enter", -1)
+        exit_id = self.region_name_to_id.get(base_name + "_exit", -1)
+        
+        return lax.cond(is_moving_towards, lambda: enter_id, lambda: exit_id)

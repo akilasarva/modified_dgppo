@@ -560,6 +560,7 @@ class LidarEnv(MultiAgentEnv, ABC):
         ]
 
         bearing = graph.env_states.bearing
+        
         from dgppo.env.bridge_behavior_associator import BehaviorBridge
         associator = BehaviorBridge(
             bridges=bridge_walls_params,
