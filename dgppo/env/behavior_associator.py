@@ -22,13 +22,13 @@ from typing import List, Optional, Union, Tuple, Dict, Any
 
 class BehaviorAssociator:
 
-    def __init__(self, bridges, buildings, obstacles, all_region_names): #key: jax.Array, all_region_names: List[str], **kwargs: Dict[str, Any]):
-        #self.key = key
-        self.bridges = bridges
-        self.buildings = buildings
-        self.obstacles = obstacles
+    def __init__(self, key: jax.Array, all_region_names: List[str], **kwargs: Dict[str, Any]):
+        self.key = key
+        # self.bridges = bridges
+        # self.buildings = buildings
+        # self.obstacles = obstacles
         self.all_region_names = all_region_names
-        #self.params = kwargs
+        self.params = kwargs
         self.behavior_regions = self._define_behavior_regions()
 
         self._initialize_full_region_maps()

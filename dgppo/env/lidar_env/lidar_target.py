@@ -33,7 +33,7 @@ def _calculate_cluster_reward_per_agent(
     current_cluster_oh_episode_i: Array,
     start_cluster_oh_episode_i: Array,
     next_cluster_oh_episode_i: Array,
-    #has_been_awarded: jnp.ndarray,
+    has_been_awarded: jnp.ndarray,
     # Reward coefficients
     next_cluster_bonus: float,
     stay_in_cluster_bonus: float,
@@ -51,13 +51,13 @@ def _calculate_cluster_reward_per_agent(
                                  (current_cluster_id_episode_i != start_cluster_id_episode_i)
                                  
     # `give_bonus` is true only on the first step the agent moves into the next cluster
-    give_bonus = has_moved_into_next_cluster #& (~has_been_awarded)
+    give_bonus = has_moved_into_next_cluster & (~has_been_awarded)
 
     # Award the one-time bonus correctly
     bonus_reward = jnp.where(give_bonus, next_cluster_bonus, 0.0)
     
     # Update the flag to prevent future bonuses
-    updated_has_been_awarded = give_bonus #jnp.logical_or(has_been_awarded, give_bonus)
+    updated_has_been_awarded = jnp.logical_or(has_been_awarded, give_bonus)
     
     current_agent_reward += bonus_reward
     
@@ -75,6 +75,7 @@ def _calculate_cluster_reward_per_agent(
     )
 
     return current_agent_reward, updated_has_been_awarded
+
 
 class LidarTarget(LidarEnv):
 
@@ -114,61 +115,67 @@ class LidarTarget(LidarEnv):
         self.intersection_params = intersection_params
         
     # @ft.partial(jax.jit, static_argnums=(0,))
-    def get_reward(self, graph: LidarEnvGraphsTuple, action: Action, bonus_awarded_state: jnp.ndarray) -> Tuple[Reward, jnp.ndarray]:
+    def get_reward(self, graph: LidarEnvGraphsTuple, action: Action) -> Tuple[Reward, jnp.ndarray]:
         agent_states = graph.type_states(type_idx=0, n_type=self.num_agents)
-        agent_vel = agent_states[:, 2:4]
-        
-        env_states = graph.env_states
-        current_cluster_oh = env_states.current_cluster_oh
-        start_cluster_oh = env_states.start_cluster_oh
-        next_cluster_oh = env_states.next_cluster_oh
-        
-        actual_cluster_id = jnp.argmax(current_cluster_oh, axis=-1)
-        next_cluster_id = jnp.argmax(next_cluster_oh, axis=-1)
-        
-        is_in_next_cluster = (actual_cluster_id == next_cluster_id)
-        
-        bearing = env_states.bearing
-        bearing_reward_per_agent = jax_vmap(_calculate_bearing_reward)(agent_vel, bearing)
-        dense_reward = jnp.where(~is_in_next_cluster, bearing_reward_per_agent, 0.0).mean()
-        reward = dense_reward * self.COSINE_SIM_REWARD_COEFF
+        goals = graph.type_states(type_idx=1, n_type=self.num_goals)
+        reward = jnp.zeros(()).astype(jnp.float32)
 
-        is_in_path_cluster = jnp.logical_or(
-            actual_cluster_id == self.CLUSTER_MAP["in_intersection"],
-            jnp.logical_or(
-                actual_cluster_id == self.CLUSTER_MAP["passage_enter"],
-                actual_cluster_id == self.CLUSTER_MAP["passage_exit"]
-            )
-        )
+        agent_vel = agent_states[:, 2:4]
+                
+        # --- Extract necessary info from env_states ---
+        env_states = graph.env_states
+        current_cluster_oh_episode = env_states.current_cluster_oh # Per-agent current high-level cluster OH
+        start_cluster_oh_episode = env_states.start_cluster_oh
+        next_cluster_oh_episode = env_states.next_cluster_oh     # Per-agent next high-level cluster OH
+        actual_cluster_id = jnp.argmax(current_cluster_oh_episode, axis=-1)
+        bonus_awarded_state = env_states.next_cluster_bonus_awarded
+
+        bearing = env_states.bearing
+
+        # Check if the agent is in the next cluster
+        next_cluster_id = jnp.argmax(next_cluster_oh_episode, axis=-1)
+        is_in_next_cluster = (actual_cluster_id == next_cluster_id)
+
+        dense_reward = jnp.where(
+            ~is_in_next_cluster,  # Condition: If NOT in the next cluster
+            jax_vmap(_calculate_bearing_reward, in_axes=(0, 0))(agent_vel, bearing).mean(),
+            0.0 # If in the next cluster, the reward is 0.0
+        ).mean()
+        reward = dense_reward * self.COSINE_SIM_REWARD_COEFF
+        #jdebug.print("dense: {}", reward)
+
+        is_building_env = env_states.intersection_params != {}
         
         vmap_cluster_reward_fn = jax_vmap(ft.partial(
             _calculate_cluster_reward_per_agent,
             stay_in_cluster_bonus=self.STAY_IN_CLUSTER_BONUS,
             next_cluster_bonus=self.NEXT_CLUSTER_BONUS,
             incorrect_cluster_penalty=self.INCORRECT_CLUSTER_PENALTY,
-        ), in_axes=(0, 0, 0))
+        ), in_axes=(0, 0, 0, 0)) # vmap over agent_pos_i, current, start, next, and bonus_awarded_state
 
-        per_agent_cluster_reward, per_agent_bonus_awarded_updated = vmap_cluster_reward_fn(
-            current_cluster_oh, 
-            start_cluster_oh,
-            next_cluster_oh, 
+        # The function call should NOT include next_cluster_bonus again
+        per_agent_reward, per_agent_bonus_awarded_updated = vmap_cluster_reward_fn(
+            current_cluster_oh_episode, 
+            start_cluster_oh_episode,
+            next_cluster_oh_episode, 
+            bonus_awarded_state
         )
 
-        reward_cluster = jnp.where(is_in_path_cluster, per_agent_cluster_reward, 0.0)
-        next_cluster_bonus_awarded_updated = jnp.where(
-            is_in_path_cluster, per_agent_bonus_awarded_updated, bonus_awarded_state
-        )
+        # Use jnp.where separately for each output
+        reward_cluster = jnp.where(is_building_env, per_agent_reward, 0.0)
+        next_cluster_bonus_awarded_updated = jnp.where(is_building_env, per_agent_bonus_awarded_updated, bonus_awarded_state)
 
         reward += jnp.mean(reward_cluster)
-        
+        #jdebug.print("cluster: {}", jnp.mean(reward_cluster))
+
         velocity_magnitude_sq = jnp.linalg.norm(agent_vel, axis=1) ** 2
         velocity_penalty = jnp.where(is_in_next_cluster, velocity_magnitude_sq, 0.0).mean()
         reward += velocity_penalty * self.VELOCITY_PENALTY_IN_CLUSTER
+        #jdebug.print("vel: {}", velocity_penalty * self.VELOCITY_PENALTY_IN_CLUSTER)
         
         reward -= (jnp.linalg.norm(action, axis=1) ** 2).mean() * 0.001
 
-        return reward, next_cluster_bonus_awarded_updated
-    
+        return reward*0.1, next_cluster_bonus_awarded_updated
     def state2feat(self, state: State) -> Array:
         return state
 

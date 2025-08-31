@@ -27,7 +27,6 @@ DEFAULT_MAX_STEP = 128
 
 
 def make_env(
-        #key: jax.Array,
         env_id: str,
         num_agents: int,
         max_step: int = None,
@@ -46,7 +45,6 @@ def make_env(
         area_size = params['default_area_size']
         params['comm_radius'] = area_size * 10
     return ENV[env_id](
-        #key=key,
         num_agents=num_agents,
         area_size=None,
         max_step=max_step,

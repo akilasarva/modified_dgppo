@@ -18,11 +18,6 @@ from dgppo.trainer.utils import is_connected
 def train(args):
     print(f"> Running train.py {args}")
     
-    #master_key = jax.random.PRNGKey(args.seed)
-
-    # Split the master key to get a key for environment initialization
-    #env_key, test_env_key, master_key = jax.random.split(master_key, 3)
-
     # set up environment variables and seed
     os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
     if not is_connected():
@@ -34,7 +29,6 @@ def train(args):
 
     # create environments (these are created regardless of resume/new run)
     env = make_env(
-        #key=env_key,
         env_id=args.env,
         num_agents=args.num_agents,
         num_obs=args.obs,
@@ -42,7 +36,6 @@ def train(args):
         full_observation=args.full_observation,
     )
     env_test = make_env(
-        #key=test_env_key,
         env_id=args.env,
         num_agents=args.num_agents,
         num_obs=args.obs,

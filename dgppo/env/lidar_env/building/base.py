@@ -45,7 +45,7 @@ class LidarEnvState(NamedTuple):
     
     @property
     def n_cluster(self) -> int:
-        return 13
+        return 4
 
 
 LidarEnvGraphsTuple = GraphsTuple[State, LidarEnvState]

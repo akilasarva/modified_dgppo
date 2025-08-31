@@ -23,6 +23,10 @@ from typing import Optional
 
 def test(args):
     print(f"> Running test.py {args}")
+    #master_key = jax.random.PRNGKey(args.seed)
+
+    # Split the master key to get a key for environment initialization
+    #env_key, test_env_key, master_key = jax.random.split(master_key, 3)
 
     stamp_str = datetime.datetime.now().strftime("%m%d-%H%M")
 
@@ -44,6 +48,7 @@ def test(args):
     n_rays = config.get('n_rays', 32)
 
     env = make_env(
+        #key=env_key,
         env_id=env_id,
         num_agents=num_agents,
         num_obs=num_obs,

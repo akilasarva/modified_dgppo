@@ -4,6 +4,7 @@ import numpy as np
 import jax
 import pathlib
 import functools as ft
+import jax.random as jr
 
 from colour import hsl2hex
 from matplotlib.animation import FuncAnimation
@@ -483,8 +484,6 @@ def render_lidar(
     n_rays: int,
     r: float,
     cost_components: Tuple[str, ...],
-    is_four_way: bool, # No key needed
-    intersection_params: dict,
     Ta_is_unsafe=None,
     viz_opts: dict = None,
     dpi: int = 100,
@@ -512,12 +511,52 @@ def render_lidar(
     if viz_opts is None:
         viz_opts = {}
         
-    behavior_associator = BehaviorIntersection(
-        key=jr.PRNGKey(0),  
-        is_four_way=is_four_way,
-        intersection_params=intersection_params,
-        all_region_names=ALL_POSSIBLE_REGION_NAMES
-    )
+    graph0 = tree_index(rollout.graph, 0)
+    first_env_state = graph0.env_states
+    
+    # building_center_sim = np.array(first_env_state.building_center) if hasattr(first_env_state, 'building_center') and first_env_state.building_center is not None else np.array([0., 0.])
+    # building_width_sim = float(first_env_state.building_width) if hasattr(first_env_state, 'building_width') and first_env_state.building_width is not None else 0.0
+    # building_height_sim = float(first_env_state.building_height) if hasattr(first_env_state, 'building_height') and first_env_state.building_height is not None else 0.0
+    # building_theta_sim = float(first_env_state.building_theta) if hasattr(first_env_state, 'building_theta') and first_env_state.building_theta is not None else 0.0 # radians
+
+    # buildings_for_associator = []
+    # if building_width_sim > 0.0:
+    #     buildings_for_associator = [(
+    #         building_center_sim,
+    #         building_width_sim,
+    #         building_height_sim,
+    #         building_theta_sim,
+    #     )]
+
+    
+    obstacles_for_associator = []
+    if first_env_state.obstacle is not None:
+        if isinstance(first_env_state.obstacle, Rectangle):
+            for i in range(len(first_env_state.obstacle.center)):
+                center_x, center_y = first_env_state.obstacle.center[i][:2].tolist()
+                
+                length_x_val = np.asarray(first_env_state.obstacle.width[i])
+                length_x = float(length_x_val[0]) if length_x_val.ndim > 0 else float(length_x_val)
+
+                length_y_val = np.asarray(first_env_state.obstacle.height[i])
+                length_y = float(length_y_val[0]) if length_y_val.ndim > 0 else float(length_y_val)
+
+                theta_val = np.asarray(first_env_state.obstacle.theta[i])
+                theta = float(theta_val[0]) if theta_val.ndim > 0 else float(theta_val)
+                
+                obstacles_for_associator.append(("rect", (center_x, center_y, length_x, length_y, theta)))
+        
+        elif isinstance(first_env_state.obstacle, Sphere):
+            for i in range(len(first_env_state.obstacle.center)):
+                center_x, center_y = first_env_state.obstacle.center[i][:2].tolist()
+                radius = float(first_env_state.obstacle.radius[i].item()) if hasattr(first_env_state.obstacle.radius[i], 'item') else float(first_env_state.obstacle.radius[i])
+                obstacles_for_associator.append(("circle", (center_x, center_y, radius)))
+
+    # behavior_associator = BehaviorIntersection(
+    #     buildings=buildings_for_associator,
+    #     all_region_names=ALL_POSSIBLE_REGION_NAMES,
+    #     obstacles=obstacles_for_associator
+    # )
     
     # Visualize the behavior regions
     if dim == 2:

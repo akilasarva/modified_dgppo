@@ -12,43 +12,17 @@ from jax.lax import cond
 from dgppo.env.behavior_associator import BehaviorAssociator
 
 class BehaviorIntersection(BehaviorAssociator):
-    def __init__(self, key: jr.PRNGKey, is_four_way: bool, intersection_params: Dict, obstacles: List = [], all_region_names: List[str] = [], params=None, area_size=None):
+    def __init__(self, key: jr.PRNGKey, is_four_way: bool, intersection_params: Dict, all_region_names: List[str] = [], params=None, area_size=None):
         self.key = key
         self.params = params if params is not None else {}
         self.all_region_names = all_region_names
         self.area_size = area_size
-        self.obstacles = obstacles
+        
+        # Store provided parameters directly, without random generation
         self.is_four_way = is_four_way
         self.intersection_params = intersection_params
         
-        # Conditionally determine `self.is_four_way` based on the input argument
-        if is_four_way is None:
-            key_is_four_way, self.key = jax.random.split(self.key)
-            is_four_way_p = self.params.get('is_four_way_p', 0.5)
-            self.is_four_way = bool(jax.random.uniform(key_is_four_way) < is_four_way_p)
-        else:
-            self.is_four_way = is_four_way
-
-        # Conditionally determine `self.intersection_params` based on the input argument
-        if intersection_params is None:
-            if self.area_size is None:
-                raise ValueError("area_size must be provided to randomly generate intersection parameters.")
-                
-            key_intersection, self.key = jax.random.split(self.key)
-            key_center, key_size = jax.random.split(key_intersection)
-            
-            self.intersection_params = {
-                'center': jax.random.uniform(key_center, shape=(2,), minval=-self.area_size / 2, maxval=self.area_size / 2),
-                'size': jax.random.uniform(key_size, shape=(), minval=5.0, maxval=10.0),
-                'passage_min': 0.25,  # Example default value, adjust as needed
-                'passage_max': 0.5,  # Example default value, adjust as needed
-                'obs_len_min': 0.4, # Example default value, adjust as needed
-                'obs_len_max': 0.75, # Example default value, adjust as needed
-            }
-        else:
-            self.intersection_params = intersection_params
-
-        # Generate region names based on the determined `self.is_four_way`
+        # Generate region names based on the provided `self.is_four_way`
         num_passages = 4 if self.is_four_way else 3
         self.all_region_names = ["open_space", "in_intersection"]
         
@@ -62,23 +36,17 @@ class BehaviorIntersection(BehaviorAssociator):
             area_size=self.area_size,
             **self.params
         )
-    
+
     def _define_behavior_regions(self):
         """
         Defines the polygonal regions of the intersection using JAX.
         This function is designed to be pure and JIT-compatible.
         """
-        key, subkey_center, subkey_angle, subkey_dims = jr.split(self.key, 4)
-
-        regions = {}
-        regions["open_space"] = jnp.array([(0, 0), (50, 0), (50, 50), (0, 50)], dtype=jnp.float32)
-
-        # Randomly determine the center, rotation, and dimensions of the intersection
-        center = jr.uniform(subkey_center, shape=(2,), minval=15.0, maxval=35.0)
-        global_angle = jr.uniform(subkey_angle, shape=(), minval=0.0, maxval=2 * jnp.pi)
-        
-        passage_width = jr.uniform(subkey_dims, minval=self.intersection_params["passage_min"], maxval=self.intersection_params["passage_max"])
-        obs_len = jr.uniform(subkey_dims, shape=(), minval=self.intersection_params["obs_len_min"], maxval=self.intersection_params["obs_len_max"])
+        # Read parameters directly from the class instance
+        center = self.intersection_params['center']
+        global_angle = self.intersection_params['global_angle']
+        passage_width = self.intersection_params['passage_width']
+        obs_len = self.intersection_params['obs_len']
         
         half_gap = passage_width / 2.0
         
@@ -97,7 +65,7 @@ class BehaviorIntersection(BehaviorAssociator):
             
             # Rotate and translate the central square
             rotated_corners = jnp.einsum('ij,kj->ki', rotation_matrix, inner_corners_local)
-            regions["in_intersection"] = rotated_corners + center
+            in_intersection_region = rotated_corners + center
             
             # Define and transform the passage regions (trapezoids)
             passage_0_local = jnp.array([[-half_gap, half_gap], [half_gap, half_gap], [half_gap, 50], [-half_gap, 50]])
@@ -110,45 +78,31 @@ class BehaviorIntersection(BehaviorAssociator):
                     passage_0_local, passage_1_local, passage_2_local, passage_3_local
                 ]
             ]
-            regions["passage_0_enter"] = regions["passage_0_exit"] = rotated_passages[0]
-            regions["passage_1_enter"] = regions["passage_1_exit"] = rotated_passages[1]
-            regions["passage_2_enter"] = regions["passage_2_exit"] = rotated_passages[2]
-            regions["passage_3_enter"] = regions["passage_3_exit"] = rotated_passages[3]
-
         else: # 3-way intersection
             # Define the vertices for the central trapezoid, relative to a (0,0) center.
             long_obs_len = obs_len + passage_width + obs_len
             inner_corners_local = jnp.array([
-                [-long_obs_len / 2.0, obs_len / 2.0],  # Top-left vertex
-                [long_obs_len / 2.0, obs_len / 2.0],   # Top-right vertex
-                [half_gap, -obs_len / 2.0],              # Bottom-right vertex
-                [-half_gap, -obs_len / 2.0]               # Bottom-left vertex
+                [-long_obs_len / 2.0, obs_len / 2.0],
+                [long_obs_len / 2.0, obs_len / 2.0],
+                [half_gap, -obs_len / 2.0],
+                [-half_gap, -obs_len / 2.0]
             ])
 
             # Rotation matrix for the global angle
             cos_a, sin_a = jnp.cos(global_angle), jnp.sin(global_angle)
             rotation_matrix = jnp.array([[cos_a, -sin_a], [sin_a, cos_a]])
 
-            # Rotate and translate the central trapezoid
             rotated_corners = jnp.einsum('ij,kj->ki', rotation_matrix, inner_corners_local)
-            regions["in_intersection"] = rotated_corners + center
+            in_intersection_region = rotated_corners + center
 
-            # Define and transform the passage regions for the 3-way
             passage_0_local = jnp.array([
-                [-half_gap, -obs_len / 2.0],
-                [half_gap, -obs_len / 2.0],
-                [half_gap, -50],
-                [-half_gap, -50]
+                [-half_gap, -obs_len / 2.0], [half_gap, -obs_len / 2.0], [half_gap, -50], [-half_gap, -50]
             ])
             passage_1_local = jnp.array([
-                [-long_obs_len / 2.0, obs_len / 2.0],
-                [-50, 50],
-                [-50, obs_len / 2.0]
+                [-long_obs_len / 2.0, obs_len / 2.0], [-50, 50], [-50, obs_len / 2.0]
             ])
             passage_2_local = jnp.array([
-                [long_obs_len / 2.0, obs_len / 2.0],
-                [50, 50],
-                [50, obs_len / 2.0]
+                [long_obs_len / 2.0, obs_len / 2.0], [50, 50], [50, obs_len / 2.0]
             ])
 
             rotated_passages = [
@@ -156,9 +110,13 @@ class BehaviorIntersection(BehaviorAssociator):
                     passage_0_local, passage_1_local, passage_2_local
                 ]
             ]
-            regions["passage_0_enter"] = regions["passage_0_exit"] = rotated_passages[0]
-            regions["passage_1_enter"] = regions["passage_1_exit"] = rotated_passages[1]
-            regions["passage_2_enter"] = regions["passage_2_exit"] = rotated_passages[2]
+        
+        regions = {}
+        regions["open_space"] = jnp.array([(0, 0), (50, 0), (50, 50), (0, 50)], dtype=jnp.float32)
+        regions["in_intersection"] = in_intersection_region
+        
+        for i, passage in enumerate(rotated_passages):
+            regions[f"passage_{i}_enter"] = regions[f"passage_{i}_exit"] = passage
 
         return regions
 
@@ -173,13 +131,6 @@ class BehaviorIntersection(BehaviorAssociator):
             properties[f"passage_{p}_exit"] = {"label": f"Passage {p} Exit", "color": "lightgreen", "alpha": 0.5}
         return properties
 
-    @partial(jax.jit, static_argnums=(0,))
-    def get_region_centroid(self, region_id: jnp.ndarray):
-        """Returns the centroid of a specified polygon region."""
-        # This will work because we are only using polygons now
-        centroid = jnp.mean(self.behavior_regions_jax_array[region_id], axis=0)
-        return centroid
-        
     @partial(jax.jit, static_argnums=(0,))
     def get_current_behavior_direction(self, pos: jnp.ndarray, vel: jnp.ndarray) -> jnp.ndarray:
         """
