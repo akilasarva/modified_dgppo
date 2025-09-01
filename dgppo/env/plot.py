@@ -21,13 +21,13 @@ from ..trainer.utils import centered_norm
 from ..utils.typing import EdgeIndex, Pos2d, Pos3d, Array
 from ..utils.utils import merge01, tree_index, MutablePatchCollection, save_anim
 from dgppo.env.obstacle import Cuboid, Sphere, Obstacle, Rectangle
-from dgppo.env.building_behavior_associator import BehaviorBuildings
+from dgppo.env.bridge_behavior_associator import BehaviorBridge
 
 ALL_POSSIBLE_REGION_NAMES = [
         "open_space",
-        "along_wall_0", "along_wall_1", "along_wall_2", "along_wall_3",
-        "past_building_0", "past_building_1", "past_building_2", "past_building_3",
-        "around_corner_0", "around_corner_1", "around_corner_2", "around_corner_3"
+        "approach_bridge_0",
+        "on_bridge_0",
+        "exit_bridge_0"
     ]
 
 def plot_graph(
@@ -210,7 +210,376 @@ def get_f1tenth_body(
 
     return body
 
+def render_lidar(
+        rollout: Rollout,
+        video_path: pathlib.Path,
+        side_length: float,
+        dim: int,
+        n_agent: int,
+        n_rays: int,
+        r: float,
+        cost_components: Tuple[str, ...],
+        Ta_is_unsafe=None,
+        viz_opts: dict = None,
+        dpi: int = 100,
+        n_goal: Optional[int] = None,
+        **kwargs
+):
+    assert dim == 1 or dim == 2 or dim == 3
+    if n_goal is None:
+        n_goal = n_agent
 
+    # set up visualization option
+    if dim == 1 or dim == 2:
+        ax: Axes
+        fig, ax = plt.subplots(1, 1, figsize=(10, 10), dpi=dpi)
+    else:
+        fig = plt.figure(figsize=(10, 10), dpi=dpi)
+        ax: Axes3D = fig.add_subplot(projection='3d')
+    ax.set_xlim(0., side_length)
+    ax.set_ylim(0., side_length)
+    if dim == 3:
+        ax.set_zlim(0., side_length)
+    ax.set(aspect="equal")
+    if dim == 2:
+        plt.axis("off")
+
+    if viz_opts is None:
+        viz_opts = {}
+
+    # --- CRITICAL FIX: Extract ALL environment parameters from the *first frame of the rollout* ---
+    graph0 = tree_index(rollout.graph, 0) # Get the initial graph state
+    first_env_state = graph0.env_states
+
+    # Extract bridge parameters directly from the rollout's initial env state
+    # These are the *actual* parameters used in the simulation for this rollout.
+    # Convert JAX arrays to numpy scalars/arrays for Python/Matplotlib/Shapely compatibility
+    bridge_center_sim = np.array(first_env_state.bridge_center) if first_env_state.bridge_center is not None else np.array([0., 0.])
+    bridge_length_sim = float(first_env_state.bridge_length) if first_env_state.bridge_length is not None else 0.0
+    bridge_gap_width_sim = float(first_env_state.bridge_gap_width) if first_env_state.bridge_gap_width is not None else 0.0
+    bridge_wall_thickness_sim = float(first_env_state.bridge_wall_thickness) if first_env_state.bridge_wall_thickness is not None else 0.0
+    bridge_theta_sim = float(first_env_state.bridge_theta) if first_env_state.bridge_theta is not None else 0.0 # radians
+
+    bridges_for_associator = []
+    if bridge_length_sim > 0: # Only create if bridge exists
+        half_dist_to_wall_center = (bridge_gap_width_sim / 2) + (bridge_wall_thickness_sim / 2)
+        offset_x = -half_dist_to_wall_center * np.sin(bridge_theta_sim)
+        offset_y = half_dist_to_wall_center * np.cos(bridge_theta_sim)
+
+        # These are the *centers* of the two bridge walls, as determined by the environment
+        center1_wall = bridge_center_sim + np.array([offset_x, offset_y])
+        center2_wall = bridge_center_sim - np.array([offset_x, offset_y])
+
+        wall_width = bridge_length_sim
+        wall_height = bridge_wall_thickness_sim
+        
+        bridge_theta_deg_sim = np.degrees(bridge_theta_sim) # BehaviorAssociator expects degrees
+        
+        # Pass the centers and dimensions to BehaviorAssociator
+        bridges_for_associator = [
+            (float(center1_wall[0]), float(center1_wall[1]), wall_width, wall_height, bridge_theta_deg_sim),
+            (float(center2_wall[0]), float(center2_wall[1]), wall_width, wall_height, bridge_theta_deg_sim)
+        ]
+    else:
+        bridges_for_associator = []
+
+    obstacles_for_associator = []
+    first_env_state = rollout.graph.env_states
+    if first_env_state.obstacle is not None:
+        if isinstance(first_env_state.obstacle, Rectangle):
+            for i in range(len(first_env_state.obstacle.center)):
+                center_x, center_y = first_env_state.obstacle.center[i][:2].tolist()
+                
+                length_x_val = np.asarray(first_env_state.obstacle.width[i])
+                length_x = float(length_x_val[0]) if length_x_val.ndim > 0 else float(length_x_val)
+
+                length_y_val = np.asarray(first_env_state.obstacle.height[i])
+                length_y = float(length_y_val[0]) if length_y_val.ndim > 0 else float(length_y_val)
+
+                theta_val = np.asarray(first_env_state.obstacle.theta[i])
+                theta = float(theta_val[0]) if theta_val.ndim > 0 else float(theta_val)
+                # --- END MODIFIED LINES ---
+
+                obs_sx = center_x - (length_x / 2) * np.cos(theta) + (length_y / 2) * np.sin(theta)
+                obs_sy = center_y - (length_x / 2) * np.sin(theta) - (length_y / 2) * np.cos(theta)
+
+                obstacles_for_associator.append(("rect", (obs_sx, obs_sy, length_x, length_y, np.degrees(theta))))
+        
+        elif isinstance(first_env_state.obstacle, Sphere):
+            for i in range(len(first_env_state.obstacle.center)):
+                center_x, center_y = first_env_state.obstacle.center[i][:2].tolist()
+                radius = float(first_env_state.obstacle.radius[i].item()) if hasattr(first_env_state.obstacle.radius[i], 'item') else float(first_env_state.obstacle.radius[i])
+                obstacles_for_associator.append(("circle", (center_x, center_y, radius)))
+        # Add Cuboid handling if needed, projecting to 2D for BehaviorAssociator
+
+    behavior_associator = BehaviorBridge(
+        bridges=bridges_for_associator, # adjust with correct bridge params
+        all_region_names=ALL_POSSIBLE_REGION_NAMES
+    )
+    
+    # Visualize the behavior regions
+    if dim == 2: # Only visualize in 2D
+        behavior_associator.visualize_behavior_regions(ax)
+
+    # plot the first frame
+    T_graph = rollout.graph
+    graph0 = tree_index(T_graph, 0)
+
+    agent_color = "#0068ff"
+    goal_color = "#2fdd00"
+    obs_color = "#8a0000"
+    edge_goal_color = goal_color
+
+    # plot obstacles (existing logic) - these are the actual obstacle patches
+    if hasattr(graph0.env_states, "obstacle"):
+        obs = graph0.env_states.obstacle
+        if obs is not None:
+            if isinstance(obs, Rectangle):
+                # The `get_obs_collection` returns a PatchCollection which works for 2D.
+                obs_col = get_obs_collection(obs, obs_color, alpha=1.0)
+                ax.add_collection(obs_col)
+            elif dim == 3 and (isinstance(obs, Cuboid) or isinstance(obs, Sphere)):
+                # Handle 3D obstacles
+                obs_col = get_obs_collection(obs, obs_color, alpha=0.8)
+                ax.add_collection(obs_col)
+                
+    initial_agent_positions = np.array(graph0.env_states.agent[:n_agent, :dim]).astype(np.float32)
+    goal_positions = np.array(graph0.states[n_agent:n_agent+n_goal, :dim]).astype(np.float32)
+         
+    if dim == 1 or dim == 2:
+        initial_pos_marker_collection = ax.scatter(initial_agent_positions[:, 0], initial_agent_positions[:, 1],
+                                                marker='x', color='black', s=50, linewidth=2, zorder=8, label="Initial Pos")
+        # --- NEW CODE: Draw an arrow from the initial position to the goal ---
+        if dim == 2:
+            for i in range(n_agent):
+                start_x, start_y = initial_agent_positions[i]
+                end_x, end_y = goal_positions[i]
+                
+                # Calculate the vector from start to end
+                dx = end_x - start_x
+                dy = end_y - start_y
+                
+                ax.arrow(
+                    start_x, start_y, 
+                    dx, dy,
+                    head_width=0.03,        # Size of the arrow head
+                    head_length=0.05,       # Length of the arrow head
+                    fc=edge_goal_color,     # Face color
+                    ec=edge_goal_color,     # Edge color
+                    length_includes_head=True, # Ensure the length is correct
+                    alpha=0.6,
+                    zorder=7,
+                )
+
+    # plot agents
+    n_hits = n_agent * n_rays
+    n_color = [agent_color] * n_agent + [goal_color] * n_goal
+    n_pos = np.array(graph0.states[:n_agent + n_goal, :dim]).astype(np.float32)
+    n_radius = np.array([r] * (n_agent + n_goal))
+    if dim == 1 or dim == 2:
+        if dim == 1:
+            n_pos = np.concatenate([n_pos, np.ones((n_agent + n_goal, 1)) * side_length / 2], axis=1)
+        agent_circs = [plt.Circle(n_pos[ii], n_radius[ii], color=n_color[ii], linewidth=0.0)
+                       for ii in range(n_agent + n_goal)]
+        agent_col = MutablePatchCollection([i for i in reversed(agent_circs)], match_original=True, zorder=6)
+        ax.add_collection(agent_col)
+    else:
+        plot_r = ax.transData.transform([r, 0])[0] - ax.transData.transform([0, 0])[0]
+        agent_col = ax.scatter(n_pos[:, 0], n_pos[:, 1], n_pos[:, 2],
+                               s=plot_r, c=n_color, zorder=5)  # todo: the size of the agent might not be correct
+
+    # plot edges
+    all_pos = graph0.states[:n_agent + n_goal + n_hits, :dim]
+    if dim == 1:
+        all_pos = np.concatenate([all_pos, np.ones((n_agent + n_goal + n_hits, 1)) * side_length / 2], axis=1)
+    edge_index = np.stack([graph0.senders, graph0.receivers], axis=0)
+    is_pad = np.any(edge_index == n_agent + n_goal + n_hits, axis=0)
+    e_edge_index = edge_index[:, ~is_pad]
+    e_start, e_end = all_pos[e_edge_index[0, :]], all_pos[e_edge_index[1, :]]
+    e_lines = np.stack([e_start, e_end], axis=1)  # (e, n_pts, dim)
+    e_is_goal = (n_agent <= graph0.senders) & (graph0.senders < n_agent + n_goal)
+    e_is_goal = e_is_goal[~is_pad]
+    e_colors = [edge_goal_color if e_is_goal[ii] else "0.2" for ii in range(len(e_start))]
+    if dim == 1:
+        e_lines = e_lines[~e_is_goal]
+        e_colors = "0.2"
+        edge_col = LineCollection(e_lines, colors=e_colors, linewidths=2, alpha=0.5, zorder=3)
+    elif dim == 2:
+        edge_col = LineCollection(e_lines, colors=e_colors, linewidths=2, alpha=0.5, zorder=3)
+    else:
+        edge_col = Line3DCollection(e_lines, colors=e_colors, linewidths=2, alpha=0.5, zorder=3)
+    ax.add_collection(edge_col)
+
+    # text for cost and reward
+    text_font_opts = dict(
+        size=16,
+        color="k",
+        family="cursive",
+        weight="normal",
+        transform=ax.transAxes,
+    )
+    if dim == 1 or dim == 2:
+        cost_text = ax.text(0.02, 1.00, "Cost: 1.0\nReward: 1.0", va="bottom", **text_font_opts)
+    else:
+        cost_text = ax.text2D(0.02, 1.00, "Cost: 1.0\nReward: 1.0", va="bottom", **text_font_opts)
+
+    # text for safety
+    safe_text = []
+    if Ta_is_unsafe is not None:
+        if dim == 1 or dim == 2:
+            safe_text = [ax.text(0.99, 1.00, "Unsafe: {}", va="bottom", ha="right", **text_font_opts)]
+        else:
+            safe_text = [ax.text2D(0.99, 1.00, "Unsafe: {}", va="bottom", ha="right", **text_font_opts)]
+
+    # text for time step
+    if dim == 1 or dim == 2:
+        kk_text = ax.text(0.99, 1.04, "kk=0", va="bottom", ha="right", **text_font_opts)
+    else:
+        kk_text = ax.text2D(0.99, 1.04, "kk=0", va="bottom", ha="right", **text_font_opts)
+
+    # add agent labels
+    label_font_opts = dict(
+        size=20,
+        color="k",
+        family="cursive",
+        weight="normal",
+        ha="center",
+        va="center",
+        transform=ax.transData,
+        clip_on=True,
+        zorder=7,
+    )
+    agent_labels = []
+    if dim == 1 or dim == 2:
+        agent_labels = [ax.text(n_pos[ii, 0], n_pos[ii, 1], f"{ii}", **label_font_opts) for ii in range(n_agent)]
+    else:
+        for ii in range(n_agent):
+            pos2d = proj3d.proj_transform(n_pos[ii, 0], n_pos[ii, 1], n_pos[ii, 2], ax.get_proj())[:2]
+            agent_labels.append(ax.text2D(pos2d[0], pos2d[1], f"{ii}", **label_font_opts))
+
+    # plot cbf
+    cnt_col = []
+    if "cbf" in viz_opts:
+        if dim == 1 or dim == 3:
+            print('Warning: CBF visualization is not supported in 1D or 3D.')
+        else:
+            Tb_xs, Tb_ys, Tbb_h, cbf_num = viz_opts["cbf"]
+            bb_Xs, bb_Ys = np.meshgrid(Tb_xs[0], Tb_ys[0])
+            norm = centered_norm(Tbb_h.min(), Tbb_h.max())
+            levels = np.linspace(norm.vmin, norm.vmax, 15)
+
+            cmap = get_BuRd().reversed()
+            contour_opts = dict(cmap=cmap, norm=norm, levels=levels, alpha=0.9)
+            cnt = ax.contourf(bb_Xs, bb_Ys, Tbb_h[0], **contour_opts)
+
+            contour_line_opts = dict(levels=[0.0], colors=["k"], linewidths=3.0)
+            cnt_line = ax.contour(bb_Xs, bb_Ys, Tbb_h[0], **contour_line_opts)
+
+            cbar = fig.colorbar(cnt, ax=ax)
+            cbar.add_lines(cnt_line)
+            cbar.ax.tick_params(labelsize=36, labelfontfamily="Times New Roman")
+
+            cnt_col = [*cnt.collections, *cnt_line.collections]
+
+            ax.text(0.5, 1.0, "CBF for {}".format(cbf_num), transform=ax.transAxes, va="bottom")
+    if "Vh" in viz_opts:
+        if dim == 1 or dim == 2:
+            Vh_text = ax.text(0.99, 0.99, "Vh: []", va="top", ha="right", zorder=100, **text_font_opts)
+        else:
+            Vh_text = ax.text2D(0.99, 0.99, "Vh: []", va="top", ha="right", **text_font_opts)
+
+    # init function for animation
+    def init_fn() -> list[plt.Artist]:
+        # This list should contain all artists that will be updated in the animation.
+        # When visualizing static regions, they are added to `ax` directly and don't
+        # need to be part of the `init_fn` return if they are not dynamically updated.
+        return [agent_col, edge_col, *agent_labels, cost_text, *safe_text, *cnt_col, kk_text]
+
+    # update function for animation
+    def update(kk: int) -> list[plt.Artist]:
+        graph = tree_index(T_graph, kk)
+        n_pos_t = graph.states[:-1, :dim]
+        if dim == 1:
+            n_pos_t = np.concatenate([n_pos_t, np.ones((n_agent + n_goal, 1)) * side_length / 2], axis=1)
+
+        # update agent positions
+        if dim == 1 or dim == 2:
+            for ii in range(n_agent):
+                agent_circs[ii].set_center(tuple(n_pos_t[ii]))
+        else:
+            agent_col.set_offsets(n_pos_t[:n_agent + n_goal, :2])
+            agent_col.set_3d_properties(n_pos_t[:n_agent + n_goal, 2], zdir='z')
+
+        # update edges
+        e_edge_index_t = np.stack([graph.senders, graph.receivers], axis=0)
+        is_pad_t = np.any(e_edge_index_t == n_agent + n_goal + n_hits, axis=0)
+        e_edge_index_t = e_edge_index_t[:, ~is_pad_t]
+        e_start_t, e_end_t = n_pos_t[e_edge_index_t[0, :]], n_pos_t[e_edge_index_t[1, :]]
+        e_is_goal_t = (n_agent <= graph.senders) & (graph.senders < n_agent + n_goal)
+        e_is_goal_t = e_is_goal_t[~is_pad_t]
+        e_colors_t = [edge_goal_color if e_is_goal_t[ii] else "0.2" for ii in range(len(e_start_t))]
+        e_lines_t = np.stack([e_start_t, e_end_t], axis=1)
+        if dim == 1:
+            e_lines_t = e_lines_t[~e_is_goal_t]
+            e_colors_t = "0.2"
+        edge_col.set_segments(e_lines_t)
+        edge_col.set_colors(e_colors_t)
+
+        # update agent labels
+        for ii in range(n_agent):
+            if dim == 1 or dim == 2:
+                agent_labels[ii].set_position(n_pos_t[ii])
+            else:
+                text_pos = proj3d.proj_transform(n_pos_t[ii, 0], n_pos_t[ii, 1], n_pos_t[ii, 2], ax.get_proj())[:2]
+                agent_labels[ii].set_position(text_pos)
+
+        # update cost and safe labels
+        if kk < len(rollout.costs):
+            all_costs = ""
+            for i_cost in range(rollout.costs[kk].shape[1]):
+                all_costs += f"    {cost_components[i_cost]}: {rollout.costs[kk][:, i_cost].max():5.4f}\n"
+            all_costs = all_costs[:-2]
+
+            cost_text.set_text(f"Cost:\n{all_costs}\nReward: {rollout.rewards[kk]:5.4f}")
+        else:
+            cost_text.set_text("")
+        if kk < len(Ta_is_unsafe):
+            a_is_unsafe = Ta_is_unsafe[kk]
+            unsafe_idx = np.where(a_is_unsafe)[0]
+            safe_text[0].set_text("Unsafe: {}".format(unsafe_idx))
+        else:
+            safe_text[0].set_text("Unsafe: {}")
+
+        # Update the contourf.
+        nonlocal cnt, cnt_line
+        if "cbf" in viz_opts and dim == 2:
+            for c in cnt.collections:
+                c.remove()
+            for c in cnt_line.collections:
+                c.remove()
+
+            bb_Xs_t, bb_Ys_t = np.meshgrid(Tb_xs[kk], Tb_ys[kk])
+            cnt = ax.contourf(bb_Xs_t, bb_Ys_t, Tbb_h[kk], **contour_opts)
+            cnt_line = ax.contour(bb_Xs_t, bb_Ys_t, Tbb_h[kk], **contour_line_opts)
+
+            cnt_col_t = [*cnt.collections, *cnt_line.collections]
+        else:
+            cnt_col_t = []
+
+        if "Vh" in viz_opts:
+            Vh_text.set_text(f"Vh: {viz_opts['Vh'][kk]}")
+
+        kk_text.set_text("kk={:04}".format(kk))
+
+        return [agent_col, edge_col, *agent_labels, cost_text, *safe_text, *cnt_col_t, kk_text]
+
+    fps = 30.0
+    spf = 1 / fps
+    mspf = 1_000 * spf
+    anim_T = len(T_graph.n_node)
+    ani = FuncAnimation(fig, update, frames=anim_T, init_func=init_fn, interval=mspf, blit=True)
+    save_anim(ani, video_path)
+    
 def render_mpe(
         rollout: Rollout,
         video_path: pathlib.Path,
@@ -472,347 +841,3 @@ def render_mpe(
     ani = FuncAnimation(fig, update, frames=anim_T, init_func=init_fn, interval=mspf, blit=True)
     save_anim(ani, video_path)
 
-def render_lidar(
-    rollout: Rollout,
-    video_path: pathlib.Path,
-    side_length: float,
-    dim: int,
-    n_agent: int,
-    n_rays: int,
-    r: float,
-    cost_components: Tuple[str, ...],
-    Ta_is_unsafe=None,
-    viz_opts: dict = None,
-    dpi: int = 100,
-    n_goal: Optional[int] = None,
-    **kwargs
-):
-    assert dim == 1 or dim == 2 or dim == 3
-    if n_goal is None:
-        n_goal = n_agent
-
-    # set up visualization option
-    if dim == 1 or dim == 2:
-        fig, ax = plt.subplots(1, 1, figsize=(10, 10), dpi=dpi)
-    else:
-        fig = plt.figure(figsize=(10, 10), dpi=dpi)
-        ax = fig.add_subplot(projection='3d')
-    ax.set_xlim(0., side_length)
-    ax.set_ylim(0., side_length)
-    if dim == 3:
-        ax.set_zlim(0., side_length)
-    ax.set(aspect="equal")
-    if dim == 2:
-        plt.axis("off")
-
-    if viz_opts is None:
-        viz_opts = {}
-
-    # --- CRITICAL FIX: Extract building parameters from the *first frame of the rollout* ---
-    graph0 = tree_index(rollout.graph, 0)
-    first_env_state = graph0.env_states
-    
-    # NEW: Extract building parameters from the initial env state
-    building_center_sim = np.array(first_env_state.building_center) if hasattr(first_env_state, 'building_center') and first_env_state.building_center is not None else np.array([0., 0.])
-    building_width_sim = float(first_env_state.building_width) if hasattr(first_env_state, 'building_width') and first_env_state.building_width is not None else 0.0
-    building_height_sim = float(first_env_state.building_height) if hasattr(first_env_state, 'building_height') and first_env_state.building_height is not None else 0.0
-    building_theta_sim = float(first_env_state.building_theta) if hasattr(first_env_state, 'building_theta') and first_env_state.building_theta is not None else 0.0 # radians
-
-    # NEW: Create a list of buildings for the behavior associator
-    buildings_for_associator = []
-    if building_width_sim > 0.0:
-        # The BehaviorBuildings class expects a list of building parameters as tuples
-        buildings_for_associator = [(
-            building_center_sim,
-            building_width_sim,
-            building_height_sim,
-            building_theta_sim,
-        )]
-
-    
-    obstacles_for_associator = []
-    if first_env_state.obstacle is not None:
-        if isinstance(first_env_state.obstacle, Rectangle):
-            for i in range(len(first_env_state.obstacle.center)):
-                center_x, center_y = first_env_state.obstacle.center[i][:2].tolist()
-                
-                length_x_val = np.asarray(first_env_state.obstacle.width[i])
-                length_x = float(length_x_val[0]) if length_x_val.ndim > 0 else float(length_x_val)
-
-                length_y_val = np.asarray(first_env_state.obstacle.height[i])
-                length_y = float(length_y_val[0]) if length_y_val.ndim > 0 else float(length_y_val)
-
-                theta_val = np.asarray(first_env_state.obstacle.theta[i])
-                theta = float(theta_val[0]) if theta_val.ndim > 0 else float(theta_val)
-                
-                # --- NEW: Use a new tuple format for obstacles to avoid conflict with buildings/bridges ---
-                # A simple way is to pass the Rectangle object itself if the behavior associator can handle it,
-                # or a simple tuple like this. Assuming the latter.
-                obstacles_for_associator.append(("rect", (center_x, center_y, length_x, length_y, theta)))
-        
-        elif isinstance(first_env_state.obstacle, Sphere):
-            for i in range(len(first_env_state.obstacle.center)):
-                center_x, center_y = first_env_state.obstacle.center[i][:2].tolist()
-                radius = float(first_env_state.obstacle.radius[i].item()) if hasattr(first_env_state.obstacle.radius[i], 'item') else float(first_env_state.obstacle.radius[i])
-                obstacles_for_associator.append(("circle", (center_x, center_y, radius)))
-
-    behavior_associator = BehaviorBuildings(
-        buildings=buildings_for_associator,
-        all_region_names=ALL_POSSIBLE_REGION_NAMES,
-        obstacles=obstacles_for_associator
-    )
-    
-    # Visualize the behavior regions
-    if dim == 2:
-        behavior_associator.visualize_behavior_regions(ax)
-        
-    # plot the first frame
-    T_graph = rollout.graph
-    graph0 = tree_index(T_graph, 0)
-
-    agent_color = "#0068ff"
-    goal_color = "#2fdd00"
-    obs_color = "#8a0000"
-    edge_goal_color = goal_color
-
-    # plot obstacles (existing logic) - these are the actual obstacle patches
-    if hasattr(graph0.env_states, "obstacle"):
-        obs = graph0.env_states.obstacle
-        if obs is not None:
-            if isinstance(obs, Rectangle):
-                obs_col = get_obs_collection(obs, obs_color, alpha=1.0)
-                ax.add_collection(obs_col)
-            elif dim == 3 and (isinstance(obs, Cuboid) or isinstance(obs, Sphere)):
-                obs_col = get_obs_collection(obs, obs_color, alpha=0.8)
-                ax.add_collection(obs_col)
-                
-    initial_agent_positions = np.array(graph0.env_states.agent[:n_agent, :dim]).astype(np.float32)
-    goal_positions = np.array(graph0.states[n_agent:n_agent+n_goal, :dim]).astype(np.float32)
-         
-    if dim == 1 or dim == 2:
-        initial_pos_marker_collection = ax.scatter(initial_agent_positions[:, 0], initial_agent_positions[:, 1],
-                                                marker='x', color='black', s=50, linewidth=2, zorder=8, label="Initial Pos")
-        if dim == 2:
-            for i in range(n_agent):
-                start_x, start_y = initial_agent_positions[i]
-                end_x, end_y = goal_positions[i]
-                
-                dx = end_x - start_x
-                dy = end_y - start_y
-                
-                ax.arrow(
-                    start_x, start_y, 
-                    dx, dy,
-                    head_width=0.03,
-                    head_length=0.05,
-                    fc=edge_goal_color,
-                    ec=edge_goal_color,
-                    length_includes_head=True,
-                    alpha=0.6,
-                    zorder=7,
-                )
-
-    # plot agents
-    n_hits = n_agent * n_rays
-    n_color = [agent_color] * n_agent + [goal_color] * n_goal
-    n_pos = np.array(graph0.states[:n_agent + n_goal, :dim]).astype(np.float32)
-    n_radius = np.array([r] * (n_agent + n_goal))
-    if dim == 1 or dim == 2:
-        if dim == 1:
-            n_pos = np.concatenate([n_pos, np.ones((n_agent + n_goal, 1)) * side_length / 2], axis=1)
-        agent_circs = [plt.Circle(n_pos[ii], n_radius[ii], color=n_color[ii], linewidth=0.0)
-                       for ii in range(n_agent + n_goal)]
-        agent_col = MutablePatchCollection([i for i in reversed(agent_circs)], match_original=True, zorder=6)
-        ax.add_collection(agent_col)
-    else:
-        plot_r = ax.transData.transform([r, 0])[0] - ax.transData.transform([0, 0])[0]
-        agent_col = ax.scatter(n_pos[:, 0], n_pos[:, 1], n_pos[:, 2],
-                               s=plot_r, c=n_color, zorder=5)
-
-    # plot edges
-    all_pos = graph0.states[:n_agent + n_goal + n_hits, :dim]
-    if dim == 1:
-        all_pos = np.concatenate([all_pos, np.ones((n_agent + n_goal + n_hits, 1)) * side_length / 2], axis=1)
-    edge_index = np.stack([graph0.senders, graph0.receivers], axis=0)
-    is_pad = np.any(edge_index == n_agent + n_goal + n_hits, axis=0)
-    e_edge_index = edge_index[:, ~is_pad]
-    e_start, e_end = all_pos[e_edge_index[0, :]], all_pos[e_edge_index[1, :]]
-    e_lines = np.stack([e_start, e_end], axis=1)
-    e_is_goal = (n_agent <= graph0.senders) & (graph0.senders < n_agent + n_goal)
-    e_is_goal = e_is_goal[~is_pad]
-    e_colors = [edge_goal_color if e_is_goal[ii] else "0.2" for ii in range(len(e_start))]
-    if dim == 1:
-        e_lines = e_lines[~e_is_goal]
-        e_colors = "0.2"
-        edge_col = LineCollection(e_lines, colors=e_colors, linewidths=2, alpha=0.5, zorder=3)
-    elif dim == 2:
-        edge_col = LineCollection(e_lines, colors=e_colors, linewidths=2, alpha=0.5, zorder=3)
-    else:
-        edge_col = Line3DCollection(e_lines, colors=e_colors, linewidths=2, alpha=0.5, zorder=3)
-    ax.add_collection(edge_col)
-
-    # text for cost and reward
-    text_font_opts = dict(
-        size=16,
-        color="k",
-        family="cursive",
-        weight="normal",
-        transform=ax.transAxes,
-    )
-    if dim == 1 or dim == 2:
-        cost_text = ax.text(0.02, 1.00, "Cost: 1.0\nReward: 1.0", va="bottom", **text_font_opts)
-    else:
-        cost_text = ax.text2D(0.02, 1.00, "Cost: 1.0\nReward: 1.0", va="bottom", **text_font_opts)
-
-    # text for safety
-    safe_text = []
-    if Ta_is_unsafe is not None:
-        if dim == 1 or dim == 2:
-            safe_text = [ax.text(0.99, 1.00, "Unsafe: {}", va="bottom", ha="right", **text_font_opts)]
-        else:
-            safe_text = [ax.text2D(0.99, 1.00, "Unsafe: {}", va="bottom", ha="right", **text_font_opts)]
-
-    # text for time step
-    if dim == 1 or dim == 2:
-        kk_text = ax.text(0.99, 1.04, "kk=0", va="bottom", ha="right", **text_font_opts)
-    else:
-        kk_text = ax.text2D(0.99, 1.04, "kk=0", va="bottom", ha="right", **text_font_opts)
-
-    # add agent labels
-    label_font_opts = dict(
-        size=20,
-        color="k",
-        family="cursive",
-        weight="normal",
-        ha="center",
-        va="center",
-        transform=ax.transData,
-        clip_on=True,
-        zorder=7,
-    )
-    agent_labels = []
-    if dim == 1 or dim == 2:
-        agent_labels = [ax.text(n_pos[ii, 0], n_pos[ii, 1], f"{ii}", **label_font_opts) for ii in range(n_agent)]
-    else:
-        for ii in range(n_agent):
-            pos2d = proj3d.proj_transform(n_pos[ii, 0], n_pos[ii, 1], n_pos[ii, 2], ax.get_proj())[:2]
-            agent_labels.append(ax.text2D(pos2d[0], pos2d[1], f"{ii}", **label_font_opts))
-
-    # plot cbf
-    cnt_col = []
-    if "cbf" in viz_opts:
-        if dim == 1 or dim == 3:
-            print('Warning: CBF visualization is not supported in 1D or 3D.')
-        else:
-            Tb_xs, Tb_ys, Tbb_h, cbf_num = viz_opts["cbf"]
-            bb_Xs, bb_Ys = np.meshgrid(Tb_xs[0], Tb_ys[0])
-            norm = centered_norm(Tbb_h.min(), Tbb_h.max())
-            levels = np.linspace(norm.vmin, norm.vmax, 15)
-
-            cmap = get_BuRd().reversed()
-            contour_opts = dict(cmap=cmap, norm=norm, levels=levels, alpha=0.9)
-            cnt = ax.contourf(bb_Xs, bb_Ys, Tbb_h[0], **contour_opts)
-
-            contour_line_opts = dict(levels=[0.0], colors=["k"], linewidths=3.0)
-            cnt_line = ax.contour(bb_Xs, bb_Ys, Tbb_h[0], **contour_line_opts)
-
-            cbar = fig.colorbar(cnt, ax=ax)
-            cbar.add_lines(cnt_line)
-            cbar.ax.tick_params(labelsize=36, labelfontfamily="Times New Roman")
-
-            cnt_col = [*cnt.collections, *cnt_line.collections]
-
-            ax.text(0.5, 1.0, "CBF for {}".format(cbf_num), transform=ax.transAxes, va="bottom")
-    if "Vh" in viz_opts:
-        if dim == 1 or dim == 2:
-            Vh_text = ax.text(0.99, 0.99, "Vh: []", va="top", ha="right", zorder=100, **text_font_opts)
-        else:
-            Vh_text = ax.text2D(0.99, 0.99, "Vh: []", va="top", ha="right", **text_font_opts)
-
-    # init function for animation
-    def init_fn() -> list[plt.Artist]:
-        return [agent_col, edge_col, *agent_labels, cost_text, *safe_text, *cnt_col, kk_text]
-
-    # update function for animation
-    def update(kk: int) -> list[plt.Artist]:
-        graph = tree_index(T_graph, kk)
-        n_pos_t = graph.states[:-1, :dim]
-        if dim == 1:
-            n_pos_t = np.concatenate([n_pos_t, np.ones((n_agent + n_goal, 1)) * side_length / 2], axis=1)
-
-        # update agent positions
-        if dim == 1 or dim == 2:
-            for ii in range(n_agent):
-                agent_circs[ii].set_center(tuple(n_pos_t[ii]))
-        else:
-            agent_col.set_offsets(n_pos_t[:n_agent + n_goal, :2])
-            agent_col.set_3d_properties(n_pos_t[:n_agent + n_goal, 2], zdir='z')
-
-        # update edges
-        e_edge_index_t = np.stack([graph.senders, graph.receivers], axis=0)
-        is_pad_t = np.any(e_edge_index_t == n_agent + n_goal + n_hits, axis=0)
-        e_edge_index_t = e_edge_index_t[:, ~is_pad_t]
-        e_start_t, e_end_t = n_pos_t[e_edge_index_t[0, :]], n_pos_t[e_edge_index_t[1, :]]
-        e_is_goal_t = (n_agent <= graph.senders) & (graph.senders < n_agent + n_goal)
-        e_is_goal_t = e_is_goal_t[~is_pad_t]
-        e_colors_t = [edge_goal_color if e_is_goal_t[ii] else "0.2" for ii in range(len(e_start_t))]
-        e_lines_t = np.stack([e_start_t, e_end_t], axis=1)
-        if dim == 1:
-            e_lines_t = e_lines_t[~e_is_goal_t]
-            e_colors_t = "0.2"
-        edge_col.set_segments(e_lines_t)
-        edge_col.set_colors(e_colors_t)
-
-        # update agent labels
-        for ii in range(n_agent):
-            if dim == 1 or dim == 2:
-                agent_labels[ii].set_position(n_pos_t[ii])
-            else:
-                text_pos = proj3d.proj_transform(n_pos_t[ii, 0], n_pos_t[ii, 1], n_pos_t[ii, 2], ax.get_proj())[:2]
-                agent_labels[ii].set_position(text_pos)
-
-        # update cost and safe labels
-        if kk < len(rollout.costs):
-            all_costs = ""
-            for i_cost in range(rollout.costs[kk].shape[1]):
-                all_costs += f"    {cost_components[i_cost]}: {rollout.costs[kk][:, i_cost].max():5.4f}\n"
-            all_costs = all_costs[:-2]
-            cost_text.set_text(f"Cost:\n{all_costs}\nReward: {rollout.rewards[kk]:5.4f}")
-        else:
-            cost_text.set_text("")
-        if kk < len(Ta_is_unsafe):
-            a_is_unsafe = Ta_is_unsafe[kk]
-            unsafe_idx = np.where(a_is_unsafe)[0]
-            safe_text[0].set_text("Unsafe: {}".format(unsafe_idx))
-        else:
-            safe_text[0].set_text("Unsafe: {}")
-
-        # Update the contourf.
-        nonlocal cnt, cnt_line
-        if "cbf" in viz_opts and dim == 2:
-            for c in cnt.collections:
-                c.remove()
-            for c in cnt_line.collections:
-                c.remove()
-
-            bb_Xs_t, bb_Ys_t = np.meshgrid(Tb_xs[kk], Tb_ys[kk])
-            cnt = ax.contourf(bb_Xs_t, bb_Ys_t, Tbb_h[kk], **contour_opts)
-            cnt_line = ax.contour(bb_Xs_t, bb_Ys_t, Tbb_h[kk], **contour_line_opts)
-
-            cnt_col_t = [*cnt.collections, *cnt_line.collections]
-        else:
-            cnt_col_t = []
-
-        if "Vh" in viz_opts:
-            Vh_text.set_text(f"Vh: {viz_opts['Vh'][kk]}")
-
-        kk_text.set_text("kk={:04}".format(kk))
-
-        return [agent_col, edge_col, *agent_labels, cost_text, *safe_text, *cnt_col_t, kk_text]
-
-    fps = 30.0
-    spf = 1 / fps
-    mspf = 1_000 * spf
-    anim_T = len(T_graph.n_node)
-    ani = FuncAnimation(fig, update, frames=anim_T, init_func=init_fn, interval=mspf, blit=True)
-    save_anim(ani, video_path)

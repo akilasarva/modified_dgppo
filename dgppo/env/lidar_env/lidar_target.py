@@ -157,11 +157,10 @@ class LidarTarget(LidarEnv):
             stay_in_cluster_bonus=self.STAY_IN_CLUSTER_BONUS,
             next_cluster_bonus=self.NEXT_CLUSTER_BONUS,
             incorrect_cluster_penalty=self.INCORRECT_CLUSTER_PENALTY,
-        ), in_axes=(0, 0, 0, 0, 0)) # vmap over agent_pos_i, current, start, next, and bonus_awarded_state
+        ), in_axes=(0, 0, 0, 0)) # vmap over agent_pos_i, current, start, next, and bonus_awarded_state
 
         # The function call should NOT include next_cluster_bonus again
         per_agent_reward, per_agent_bonus_awarded_updated = vmap_cluster_reward_fn(
-            agent_states[:, :2], 
             current_cluster_oh_episode, 
             start_cluster_oh_episode,
             next_cluster_oh_episode, 
