@@ -199,7 +199,7 @@ class LidarEnv(MultiAgentEnv, ABC):
             self.CURRICULUM_TRANSITIONS_INT_IDS = jnp.array(allowed_id_transitions_list, dtype=jnp.int32)
         else:
             self.CURRICULUM_TRANSITIONS_INT_IDS = jnp.empty((0, 2), dtype=jnp.int32)
-            
+                    
         default_building_params = [(
             jnp.array([self.area_size / 2, self.area_size / 2]),
             0.5, 0.5, 0.0
@@ -290,7 +290,7 @@ class LidarEnv(MultiAgentEnv, ABC):
 
     @property
     def node_dim(self) -> int:
-        return self.state_dim + self.bearing_dim + 2 * self.cluster_oh_dim + 3
+        return self.state_dim + self.bearing_dim + 3 * self.cluster_oh_dim + 3
     
     @property
     def edge_dim(self) -> int:
@@ -438,24 +438,26 @@ class LidarEnv(MultiAgentEnv, ABC):
             
             # 2. Convert the list of IDs into a JAX array
             VALID_TRANSITIONS_INT_IDS_local = jnp.array(valid_transitions_list)
+            #jd.print("trans: {}", VALID_TRANSITIONS_INT_IDS_local)
+
             
             # 3. Select a random transition ID pair from the dynamically created array
             key_select, key_loop = jr.split(key, 2)
             transition_idx = jr.choice(key_select, jnp.arange(VALID_TRANSITIONS_INT_IDS_local.shape[0]))
             start_specific_id, goal_specific_id = VALID_TRANSITIONS_INT_IDS_local[transition_idx]
-            
             # 4. Use the specific IDs to get the correct centroids for this episode
             initial_pos = associator.all_region_centroids_jax_array[start_specific_id]
             goal_pos = associator.all_region_centroids_jax_array[goal_specific_id]
             
-            jd.print("regions: {}", associator.sorted_region_names)
+            #jd.print("regions: {}", associator.sorted_region_names)
             
             # 5. Get the general cluster IDs for one-hot encoding
             current_cluster_id = jnp.squeeze(associator.get_current_behavior(initial_pos)) #self._specific_id_to_general_id[start_specific_id]
-            start_cluster_id = start_specific_id
-            next_cluster_id = goal_specific_id #self._specific_id_to_general_id[goal_specific_id]
+            start_cluster_id = self._specific_id_to_general_id[start_specific_id]
+            next_cluster_id = self._specific_id_to_general_id[goal_specific_id]
             # jd.print("Start specific:{}", start_specific_id)
             # jd.print("Goal specific:{}", goal_specific_id)
+            # jd.print("Start cluster: {}", start_cluster_id)
             # jd.print("Current cluster:{}", current_cluster_id)
             # jd.print("Next cluster:{}", next_cluster_id)
             
@@ -473,8 +475,6 @@ class LidarEnv(MultiAgentEnv, ABC):
                 key_agent_pos, key_goal_pos, key_loop = jr.split(key, 3)
                 key = key_loop
 
-                # The positions are already JAX-compatible; no need to re-calculate.
-                # Only add a small random offset if desired.
                 initial_pos_agent = initial_pos + jr.normal(key_agent_pos, (2,)) * 0.025
                 goal_pos_agent = goal_pos + jr.normal(key_goal_pos, (2,)) * 0.025
                 
@@ -483,7 +483,6 @@ class LidarEnv(MultiAgentEnv, ABC):
 
                 bearing = jnp.arctan2(goal_pos_agent[1] - initial_pos_agent[1], goal_pos_agent[0] - initial_pos_agent[0])
                 
-                # Use the consistent IDs for one-hot encoding
                 current_cluster_oh = jax.nn.one_hot(current_cluster_id, self.n_cluster)
                 start_cluster_oh = jax.nn.one_hot(start_cluster_id, self.n_cluster)
                 next_cluster_oh = jax.nn.one_hot(next_cluster_id, self.n_cluster)
@@ -725,22 +724,22 @@ class LidarEnv(MultiAgentEnv, ABC):
         # Start cluster
         node_feats = node_feats.at[agent_start_idx:agent_start_idx+self.num_agents, self.state_dim+self.bearing_dim+self.n_cluster:self.state_dim+self.bearing_dim+2*self.n_cluster].set(state.start_cluster_oh)
         # Next cluster
-        #node_feats = node_feats.at[agent_start_idx:agent_start_idx+self.num_agents, self.state_dim+self.bearing_dim+2*self.n_cluster:self.state_dim+self.bearing_dim+3*self.n_cluster].set(state.next_cluster_oh)
+        node_feats = node_feats.at[agent_start_idx:agent_start_idx+self.num_agents, self.state_dim+self.bearing_dim+2*self.n_cluster:self.state_dim+self.bearing_dim+3*self.n_cluster].set(state.next_cluster_oh)
         # Is agent indicator (last of 3)
-        node_feats = node_feats.at[agent_start_idx:agent_start_idx+self.num_agents, self.state_dim+self.bearing_dim+2*self.n_cluster+2].set(1.0)
+        node_feats = node_feats.at[agent_start_idx:agent_start_idx+self.num_agents, self.state_dim+self.bearing_dim+3*self.n_cluster+2].set(1.0)
 
         # Goal features
         goal_start_idx = self.num_agents
         node_feats = node_feats.at[goal_start_idx:goal_start_idx+self.num_goals, :self.state_dim].set(state.goal)
         # Is goal indicator (middle)
-        node_feats = node_feats.at[goal_start_idx:goal_start_idx+self.num_goals, self.state_dim+self.bearing_dim+2*self.n_cluster+1].set(1.0)
+        node_feats = node_feats.at[goal_start_idx:goal_start_idx+self.num_goals, self.state_dim+self.bearing_dim+3*self.n_cluster+1].set(1.0)
 
         # Obstacle (lidar hits)
         if n_hits > 0 and lidar_data is not None:
             obs_start_idx = self.num_agents + self.num_goals
             node_feats = node_feats.at[obs_start_idx:obs_start_idx+n_hits, :2].set(lidar_data)
             # Is obs indicator (first)
-            node_feats = node_feats.at[obs_start_idx:obs_start_idx+n_hits, self.state_dim+self.bearing_dim+2*self.n_cluster].set(1.0)
+            node_feats = node_feats.at[obs_start_idx:obs_start_idx+n_hits, self.state_dim+self.bearing_dim+3*self.n_cluster].set(1.0)
 
         # Node types
         node_type = -jnp.ones(n_nodes, dtype=jnp.int32)

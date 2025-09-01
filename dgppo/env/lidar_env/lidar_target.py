@@ -40,6 +40,9 @@ def _calculate_cluster_reward_per_agent(
     current_cluster_id_episode_i = jnp.argmax(current_cluster_oh_episode_i)
     start_cluster_id_episode_i = jnp.argmax(start_cluster_oh_episode_i)
     next_cluster_id_episode_i = jnp.argmax(next_cluster_oh_episode_i)
+    # jdebug.print("start: {}", start_cluster_id_episode_i)
+    # jdebug.print("current: {}", current_cluster_id_episode_i)
+    # jdebug.print("next: {}", next_cluster_id_episode_i)
 
     current_agent_reward = 0.0
 
