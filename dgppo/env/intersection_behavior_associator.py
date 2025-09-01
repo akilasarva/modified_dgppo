@@ -12,45 +12,24 @@ from jax.lax import cond
 from dgppo.env.behavior_associator import BehaviorAssociator
 
 class BehaviorIntersection(BehaviorAssociator):
-    def __init__(self, key: jr.PRNGKey, is_four_way: bool, intersection_params: Dict, all_region_names: List[str] = [], params=None, area_size=None):
-        self.key = key
-        self.params = params if params is not None else {}
-        self.all_region_names = all_region_names
-        self.area_size = area_size
-        
-        # Store provided parameters directly, without random generation
-        self.is_four_way = is_four_way
-        self.intersection_params = intersection_params
-        
-        # Generate region names based on the provided `self.is_four_way`
-        num_passages = 4 if self.is_four_way else 3
-        self.all_region_names = ["open_space", "in_intersection"]
-        
-        for i in range(num_passages):
-            self.all_region_names.append(f"passage_{i}_enter")
-            self.all_region_names.append(f"passage_{i}_exit")
+    def __init__(self, intersections: List, all_region_names: List[str], buildings: List = [], bridges: List = [], obstacles: List = []):
+        if not intersections:
+            raise ValueError("BehaviorBuildings requires at least one building.")
+        super().__init__(intersections, bridges, buildings, obstacles, all_region_names)
 
-        super().__init__(
-            key=self.key,
-            all_region_names=self.all_region_names,
-            area_size=self.area_size,
-            **self.params
-        )
-
-    def _define_behavior_regions(self):
-        """
-        Defines the polygonal regions of the intersection using JAX.
-        This function is designed to be pure and JIT-compatible.
-        """
-        # Read parameters directly from the class instance
-        center = self.intersection_params['center']
-        global_angle = self.intersection_params['global_angle']
-        passage_width = self.intersection_params['passage_width']
-        obs_len = self.intersection_params['obs_len']
+    def _define_behavior_regions(self) -> Dict[str, Any]:
+        intersection_params = self.intersections[0]
+        center = jnp.array(intersection_params[0])
+        global_angle = intersection_params[3]
+        passage_width = intersection_params[1]
+        obs_len = intersection_params[2]
+        is_four_way = intersection_params[4]
         
         half_gap = passage_width / 2.0
-        
-        if self.is_four_way:
+
+        def four_way_intersection(args):
+            """Calculates regions for a four-way intersection."""
+            center, half_gap, global_angle = args
             # Vertices of the inner intersection square, relative to a (0,0) center.
             inner_corners_local = jnp.array([
                 [-half_gap, -half_gap],
@@ -73,12 +52,17 @@ class BehaviorIntersection(BehaviorAssociator):
             passage_2_local = jnp.array([[-half_gap, -half_gap], [half_gap, -half_gap], [half_gap, -50], [-half_gap, -50]])
             passage_3_local = jnp.array([[-half_gap, -half_gap], [-half_gap, half_gap], [-50, half_gap], [-50, -half_gap]])
 
-            rotated_passages = [
+            rotated_passages = jnp.stack([
                 jnp.einsum('ij,kj->ki', rotation_matrix, p) + center for p in [
                     passage_0_local, passage_1_local, passage_2_local, passage_3_local
                 ]
-            ]
-        else: # 3-way intersection
+            ])
+            
+            return in_intersection_region, rotated_passages
+
+        def three_way_intersection(args):
+            """Calculates regions for a three-way intersection and pads the output."""
+            center, half_gap, global_angle, obs_len, passage_width = args
             # Define the vertices for the central trapezoid, relative to a (0,0) center.
             long_obs_len = obs_len + passage_width + obs_len
             inner_corners_local = jnp.array([
@@ -95,22 +79,46 @@ class BehaviorIntersection(BehaviorAssociator):
             rotated_corners = jnp.einsum('ij,kj->ki', rotation_matrix, inner_corners_local)
             in_intersection_region = rotated_corners + center
 
+            # NOTE: The shapes of these arrays must all be the same (4 vertices per passage)
             passage_0_local = jnp.array([
-                [-half_gap, -obs_len / 2.0], [half_gap, -obs_len / 2.0], [half_gap, -50], [-half_gap, -50]
+                [-half_gap, -obs_len / 2.0], 
+                [half_gap, -obs_len / 2.0], 
+                [half_gap, -50], 
+                [-half_gap, -50]
             ])
+            
+            # Corrected passage arrays to have 4 vertices
             passage_1_local = jnp.array([
-                [-long_obs_len / 2.0, obs_len / 2.0], [-50, 50], [-50, obs_len / 2.0]
+                [-long_obs_len / 2.0, obs_len / 2.0], 
+                [-50, 50], 
+                [-50, obs_len / 2.0],
+                [-long_obs_len / 2.0, obs_len / 2.0] # Duplicate vertex to make it a quad
             ])
             passage_2_local = jnp.array([
-                [long_obs_len / 2.0, obs_len / 2.0], [50, 50], [50, obs_len / 2.0]
+                [long_obs_len / 2.0, obs_len / 2.0], 
+                [50, 50], 
+                [50, obs_len / 2.0],
+                [long_obs_len / 2.0, obs_len / 2.0] # Duplicate vertex to make it a quad
             ])
-
-            rotated_passages = [
+            
+            # Pad the output with a "dummy" passage to match the four-way output shape
+            # The dummy passage should also have 4 vertices
+            dummy_passage = jnp.zeros_like(passage_0_local) 
+            rotated_passages = jnp.stack([
                 jnp.einsum('ij,kj->ki', rotation_matrix, p) + center for p in [
-                    passage_0_local, passage_1_local, passage_2_local
+                    passage_0_local, passage_1_local, passage_2_local, dummy_passage
                 ]
-            ]
-        
+            ])
+            
+            return in_intersection_region, rotated_passages
+
+        # Use jax.lax.cond as before
+        in_intersection_region, rotated_passages = jax.lax.cond(
+            is_four_way,
+            partial(four_way_intersection, args=(center, half_gap, global_angle)),
+            partial(three_way_intersection, args=(center, half_gap, global_angle, obs_len, passage_width))
+        )
+
         regions = {}
         regions["open_space"] = jnp.array([(0, 0), (50, 0), (50, 50), (0, 50)], dtype=jnp.float32)
         regions["in_intersection"] = in_intersection_region
@@ -125,7 +133,8 @@ class BehaviorIntersection(BehaviorAssociator):
             "in_intersection": {"label": "Intersection", "color": "darkorange", "alpha": 0.8},
             "open_space": {"label": "Open Space", "color": "lightgray", "alpha": 0.1},
         }
-        num_passages = 4 if self.is_four_way else 3
+        is_four_way = self.intersections[0][4]
+        num_passages = 4 if is_four_way else 3
         for p in range(num_passages):
             properties[f"passage_{p}_enter"] = {"label": f"Passage {p} Enter", "color": "lightblue", "alpha": 0.5}
             properties[f"passage_{p}_exit"] = {"label": f"Passage {p} Exit", "color": "lightgreen", "alpha": 0.5}

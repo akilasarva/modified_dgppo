@@ -95,6 +95,12 @@ class LidarTarget(LidarEnv):
         "default_area_size": 1.5,
         "dist2goal": 0.01,
         "top_k_rays": 8,
+        
+        "is_four_way_p": 0.5, # Probability of generating a 4-way intersection (0.5 for a 50/50 chance)
+        "intersection_size_range": [0.5, 1], # Overall size of the intersection region
+        "passage_width_range": [0.25, 0.5], # Min/max for the width of the road passages
+        "obs_wall_range": [0.4, 0.75],
+        "building_theta_range": [0, 2 * jnp.pi],
     }
 
     def __init__(
@@ -103,16 +109,10 @@ class LidarTarget(LidarEnv):
         area_size: Optional[float] = None,
         max_step: int = 128,
         dt: float = 0.03,
-        params: dict = None,
-        key=None, # <- New parameter
-        is_four_way=None, # <- New parameter
-        intersection_params=None, # <- New parameter
+        params: dict = None
     ):
         area_size = LidarTarget.PARAMS["default_area_size"] if area_size is None else area_size
-        super(LidarTarget, self).__init__(key, num_agents, area_size, max_step, dt, params)
-        self.key = key
-        self.is_four_way = is_four_way
-        self.intersection_params = intersection_params
+        super(LidarTarget, self).__init__(num_agents, area_size, max_step, dt, params)
         
     # @ft.partial(jax.jit, static_argnums=(0,))
     def get_reward(self, graph: LidarEnvGraphsTuple, action: Action) -> Tuple[Reward, jnp.ndarray]:
@@ -144,7 +144,7 @@ class LidarTarget(LidarEnv):
         reward = dense_reward * self.COSINE_SIM_REWARD_COEFF
         #jdebug.print("dense: {}", reward)
 
-        is_building_env = env_states.intersection_params != {}
+        is_building_env = env_states.passage_width > 0
         
         vmap_cluster_reward_fn = jax_vmap(ft.partial(
             _calculate_cluster_reward_per_agent,
@@ -176,6 +176,7 @@ class LidarTarget(LidarEnv):
         reward -= (jnp.linalg.norm(action, axis=1) ** 2).mean() * 0.001
 
         return reward*0.1, next_cluster_bonus_awarded_updated
+    
     def state2feat(self, state: State) -> Array:
         return state
 

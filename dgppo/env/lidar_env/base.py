@@ -58,23 +58,6 @@ def create_fourway_intersection(
     global_angle: float
 ) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
 
-    # center = uniform(key_center, shape=(2,), minval=-area_size / 2, maxval=area_size / 2)
-    
-    # passage_width = uniform(
-    #     key_passage, 
-    #     (), 
-    #     minval=intersection_params.get("passage_min", 0.25), 
-    #     maxval=intersection_params.get("passage_max", 0.5)
-    # )
-    # obs_len = uniform(
-    #     key_obs_len, 
-    #     (), 
-    #     minval=intersection_params.get("obs_len_min", 0.4), 
-    #     maxval=intersection_params.get("obs_len_max", 0.75)
-    # )
-
-    # global_angle = uniform(key_angle, (), minval=0.0, maxval=2 * jnp.pi)
-    
     half_passage = passage_width / 2.0
     offset = obs_len / 2.0 + half_passage
 
@@ -144,6 +127,7 @@ class LidarEnv(MultiAgentEnv, ABC):
         "default_area_size": 1.5,
         "dist2goal": 0.01,
         "top_k_rays": 8,
+        "num_intersections": 1,
         
         "is_four_way_p": 0.5, # Probability of generating a 4-way intersection (0.5 for a 50/50 chance)
         "intersection_size_range": [0.5, 1], # Overall size of the intersection region
@@ -222,9 +206,8 @@ class LidarEnv(MultiAgentEnv, ABC):
         self.num_goals = self._num_agents
         self.n_cluster = n_cluster
         
-        # # --- All behavior-related data should be defined here, NOT in the reset function ---
-        # if self.n_cluster < len(set(self.CLUSTER_MAP.values())):
-        #     print(f"Warning: n_cluster ({self.n_cluster}) is less than the number of unique cluster IDs in CLUSTER_MAP ({len(set(self.CLUSTER_MAP.values()))}).")
+        if self.n_cluster < len(set(self.CLUSTER_MAP.values())):
+            print(f"Warning: n_cluster ({self.n_cluster}) is less than the number of unique cluster IDs in CLUSTER_MAP ({len(set(self.CLUSTER_MAP.values()))}).")
 
         self._id_to_curriculum_prefix_map: Dict[int, str] = {v: k for k, v in self.CLUSTER_MAP.items()}
         
@@ -249,19 +232,47 @@ class LidarEnv(MultiAgentEnv, ABC):
         else:
             self.CURRICULUM_TRANSITIONS_INT_IDS = jnp.empty((0, 2), dtype=jnp.int32)
 
-        # IMPORTANT: These must be set to None so they can be generated in the reset function.
-        # DO NOT GENERATE THEM HERE.
-        self.is_four_way = None
-        self.intersection_params = None
 
-        # The associator itself is part of the dynamic state, so it will be created in reset
-        self.associator = None
-        self._name_to_id = None
-        self._id_to_name = None
-        self.all_region_centroids_jax_array = None
+        default_inter_params = [(
+            jnp.array([self.area_size / 2, self.area_size / 2]),
+            0.5, 0.5, 0.0, True
+        )]
+
+        self.associator = BehaviorIntersection(
+            intersections=default_inter_params,
+            all_region_names=self.ALL_POSSIBLE_REGION_NAMES
+        )
+
+        # Directly store the consistent mappings from the associator
+        self._name_to_id = self.associator.region_name_to_id
+        self._id_to_name = self.associator.region_id_to_name
+        self.all_region_centroids_jax_array = self.associator.all_region_centroids_jax_array
         
-        # The transition centroids can't be prepared here because the associator doesn't exist yet
-        self.VALID_TRANSITIONS_INT_IDS = None
+        # Use the consistent mapping to prepare the curriculum
+        self._prepare_transition_centroids()
+
+        # Create the specific-to-specific transitions array using the consistent ID mapping
+        valid_transitions_list = []
+        for start_name, goal_names in self.VALID_GOAL_MAP.items():
+            if start_name in self._name_to_id:
+                start_id = self._name_to_id[start_name]
+                for goal_name in goal_names:
+                    if goal_name in self._name_to_id:
+                        goal_id = self._name_to_id[goal_name]
+                        # Exclude transitions involving open_space
+                        if start_id != self._name_to_id["open_space"] and goal_id != self._name_to_id["open_space"]:
+                            valid_transitions_list.append((start_id, goal_id))
+        
+        # Store the specific-to-specific transitions for the reset function
+        self.VALID_TRANSITIONS_INT_IDS = jnp.array(valid_transitions_list, dtype=jnp.int32)
+        # jd.print("valid trans: {}", self.VALID_TRANSITIONS_INT_IDS)
+        # Also create a mapping from specific to general IDs
+        sorted_unique_names = self.ALL_POSSIBLE_REGION_NAMES #sorted(list(self._name_to_id.keys()))
+        # jd.print("associatr labels: {}", self.associator.sorted_region_names)
+        # jd.print("labels: {}", sorted_unique_names)
+        self._specific_id_to_general_id = jnp.array([
+            self.CLUSTER_MAP.get(self._SPECIFIC_TO_GENERAL_MAP.get(name)) for name in sorted_unique_names
+        ], dtype=jnp.int32)
         
     def _prepare_transition_centroids(self):
         # This method is called from __init__
@@ -285,21 +296,16 @@ class LidarEnv(MultiAgentEnv, ABC):
         self.all_region_centroid_pairs_jax_array = jnp.array(valid_transitions_list)
 
     def _get_valid_transitions_as_ids(self):
-        # This function now correctly accesses the pre-initialized associator.
-        transitions = []
-        name_to_id = self._name_to_id
-        
-        if not hasattr(self, 'VALID_GOAL_MAP'):
-            return transitions
-
+        valid_transitions = []
         for start_specific, goals_specific in self.VALID_GOAL_MAP.items():
-            if start_specific in name_to_id:
-                start_id = name_to_id[start_specific]
+            if start_specific in self._name_to_id:
+                start_id = self._name_to_id[start_specific]
                 for goal_specific in goals_specific:
-                    if goal_specific in name_to_id:
-                        goal_id = name_to_id[goal_specific]
-                        transitions.append((start_id, goal_id))
-        return transitions
+                    if goal_specific in self._name_to_id:
+                        goal_id = self._name_to_id[goal_specific]
+                        if start_id != self._name_to_id["open_space"] and goal_id != self._name_to_id["open_space"]:
+                            valid_transitions.append((start_id, goal_id))
+        return jnp.array(valid_transitions, dtype=jnp.int32)
         
     @property
     def state_dim(self) -> int:
@@ -342,18 +348,26 @@ class LidarEnv(MultiAgentEnv, ABC):
         custom_obstacles: Optional[Tuple[Array, Array, Array, Array]] = None,
         transition_index: Optional[int] = None
     ) -> GraphsTuple:
-        
-        # Initialize lists and default values
+        if current_clusters is None:
+            current_clusters = jnp.zeros((self.num_agents, self.n_cluster), dtype=jnp.float32)
+        if start_clusters is None:
+            start_clusters = jnp.zeros((self.num_agents, self.n_cluster), dtype=jnp.float32)
+        if next_clusters is None:
+            next_clusters = jnp.zeros((self.num_agents, self.n_cluster), dtype=jnp.float32)
+
         all_obs_pos_list: List[jnp.ndarray] = []
         all_obs_len_x_list: List[jnp.ndarray] = []
         all_obs_len_y_list: List[jnp.ndarray] = []
         all_obs_theta_list: List[jnp.ndarray] = []
         
-        # This is where we'll store the intersection parameters for the env state
-        intersection_params_env_state: Dict = {}
+        inter_center_env_state: Float[Array, "2"] = jnp.array([0.0, 0.0])
+        passage_width_env_state: Float[Array, ""] = jnp.array(0.0)
+        obs_len_env_state: Float[Array, ""] = jnp.array(0.0)
+        global_angle_env_state: Float[Array, ""] = jnp.array(0.0)
+        initial_bonus_awarded = jnp.zeros(self.num_agents, dtype=jnp.bool_)
         is_four_way_env_state: bool = False
-        
-        # --- Generate Obstacles (including the intersection) ---
+        num_inter = 1 #self._params.get("num_intersections", 0)
+
         if custom_obstacles is not None:
             obs_pos, obs_len_x, obs_len_y, obs_theta = custom_obstacles
             all_obs_pos_list.append(obs_pos)
@@ -361,8 +375,9 @@ class LidarEnv(MultiAgentEnv, ABC):
             all_obs_len_y_list.append(obs_len_y)
             all_obs_theta_list.append(obs_theta)
         else:
-            # Standard random obstacles (same as your bridge code)
             n_rng_obs = self._params.get("n_obs", 0)
+            assert n_rng_obs >= 0
+            
             if n_rng_obs > 0:
                 obstacle_key, key = jr.split(key, 2)
                 obs_pos_orig = jr.uniform(obstacle_key, (n_rng_obs, 2), minval=0, maxval=self.area_size)
@@ -378,49 +393,70 @@ class LidarEnv(MultiAgentEnv, ABC):
                 all_obs_len_x_list.append(obs_len_orig[:, 0])
                 all_obs_len_y_list.append(obs_len_orig[:, 1])
                 all_obs_theta_list.append(obs_theta_orig)
-                
-            # --- Intersection-specific obstacle generation logic ---
-            # Same random parameter generation pattern as your bridge code
+
             intersection_key, key = jr.split(key)
-            is_four_way_key, center_key, angle_key, passage_key, obs_len_key = jr.split(intersection_key, 5)
+            is_four_way_key, center_key, theta_key, pass_key, obs_len_key = jr.split(intersection_key, 5)
 
-            is_four_way_env_state = self.is_four_way # Use class attribute if set, otherwise...
-            # Conditionally override with a random choice
-            is_four_way_p = self.params.get('is_four_way_p', 0.5)
-            is_four_way_env_state = True
-            # lax.cond(
-            #     self.is_four_way is None,
-            #     lambda: bool(jr.bernoulli(is_four_way_key, p=is_four_way_p)),
-            #     lambda: self.is_four_way
-            # )
+            is_four_way_choice = jr.choice(is_four_way_key, jnp.array([3,4]))
             
-            # Randomly generate intersection parameters (if not provided)
-            # intersection_params_env_state = lax.cond(
-            #     self.intersection_params is None,
-            #     lambda: {
-            #         'center': jr.uniform(center_key, shape=(2,), minval=-self.area_size / 2, maxval=self.area_size / 2),
-            #         'size': jr.uniform(key, shape=(), minval=5.0, maxval=10.0),
-            #         'passage_min': self.params.get('passage_min', 0.25),
-            #         'passage_max': self.params.get('passage_max', 0.5),
-            #         'obs_len_min': self.params.get('obs_len_min', 0.4),
-            #         'obs_len_max': self.params.get('obs_len_max', 0.75),
-            #     },
-            #     lambda: self.intersection_params
-            # )
-            
-            # Use our new obstacle-building function
-            intersection_obs_pos, intersection_obs_len_x, intersection_obs_len_y, intersection_obs_theta, intersection_params_env_state = \
-                create_intersection_obstacles(
-                    key=intersection_key,
-                    is_four_way=is_four_way_env_state,
-                    intersection_params={},
-                    area_size=self.area_size
+            if num_inter > 0:
+                # inter_rand_key, key = jr.split(key)
+                # center_key, pass_key, obs_len_key, theta_key = jr.split(inter_rand_key, 4)
+
+                passage_width = jr.uniform(pass_key, (), minval=self._params["passage_width_range"][0], maxval=self._params["passage_width_range"][1])
+                obs_len = jr.uniform(obs_len_key, (), minval=self._params["obs_wall_range"][0], maxval=self._params["obs_wall_range"][1])
+                global_angle = jr.uniform(theta_key, (), minval=0, maxval=2 * jnp.pi)
+                
+                inter_center = jr.uniform(center_key, (2,),
+                                            minval=jnp.array([self.area_size*0.4, self.area_size*0.6]),
+                                            maxval=jnp.array([self.area_size*0.4, self.area_size*0.6]))            
+                
+                def three_way_branch(args):
+                    inter_center, passage_width, obs_len, global_angle = args
+                    obs_pos, obs_len_x, obs_len_y, obs_theta = create_threeway_intersection(
+                        inter_center,
+                        passage_width,
+                        obs_len,
+                        global_angle
+                    )
+                    dummy_pos = jnp.array([1000.0, 1000.0])
+                    dummy_len_x = 0.0
+                    dummy_len_y = 0.0
+                    dummy_theta = 0.0
+
+                    obs_pos = jnp.concatenate([obs_pos, dummy_pos[None, :]], axis=0)
+                    obs_len_x = jnp.concatenate([obs_len_x, jnp.array([dummy_len_x])], axis=0)
+                    obs_len_y = jnp.concatenate([obs_len_y, jnp.array([dummy_len_y])], axis=0)
+                    obs_theta = jnp.concatenate([obs_theta, jnp.array([dummy_theta])], axis=0)
+
+                    return False, obs_pos, obs_len_x, obs_len_y, obs_theta
+
+                def four_way_branch(args):
+                    inter_center, passage_width, obs_len, global_angle = args
+                    obs_pos, obs_len_x, obs_len_y, obs_theta = create_fourway_intersection(
+                        inter_center,
+                        passage_width,
+                        obs_len,
+                        global_angle
+                    )
+                    return True, obs_pos, obs_len_x, obs_len_y, obs_theta
+
+                is_four_way_env_state, obs_pos, obs_len_x, obs_len_y, obs_theta = jax.lax.cond(
+                    is_four_way_choice == 3, # This is the boolean condition
+                    three_way_branch, # This is the function for the true branch
+                    four_way_branch, # This is the function for the false branch
+                    (inter_center, passage_width, obs_len, global_angle) # These are the arguments passed to the functions
                 )
+                
+                all_obs_pos_list.append(obs_pos)
+                all_obs_len_x_list.append(obs_len_x)
+                all_obs_len_y_list.append(obs_len_y)
+                all_obs_theta_list.append(obs_theta)
 
-            all_obs_pos_list.append(intersection_obs_pos)
-            all_obs_len_x_list.append(intersection_obs_len_x)
-            all_obs_len_y_list.append(intersection_obs_len_y)
-            all_obs_theta_list.append(intersection_obs_theta)
+                inter_center_env_state = inter_center
+                passage_width_env_state = passage_width
+                obs_len_env_state = obs_len
+                global_angle_env_state = global_angle
 
         # Combine all obstacles and create the final obstacle object
         if all_obs_pos_list:
@@ -436,75 +472,90 @@ class LidarEnv(MultiAgentEnv, ABC):
             )
         else:
             obstacles = None
+
+        if num_inter > 0:
+            inter_params_for_associator = [(
+                inter_center_env_state, 
+                passage_width_env_state, 
+                obs_len_env_state, 
+                global_angle_env_state,
+                is_four_way_env_state
+            )]
+            
+            associator = BehaviorIntersection(
+                intersections=inter_params_for_associator,
+                all_region_names=self.ALL_POSSIBLE_REGION_NAMES,
+            )
         
-        # --- Agent and Goal Generation ---
-        # Create the BehaviorIntersection object using the generated parameters
-        associator = BehaviorIntersection(
-            key=key,
-            is_four_way=is_four_way_env_state,
-            intersection_params=intersection_params_env_state,
-            all_region_names=self.ALL_POSSIBLE_REGION_NAMES,
-            area_size=self.area_size,
-            obstacles=obstacles # Pass theobstacles to the associator
-        )
+            # Use the associator to select a valid curriculum transition
+            valid_transitions_list = []
+            for start_name, goal_names in self.VALID_GOAL_MAP.items():
+                if start_name in associator.region_name_to_id:
+                    start_id = associator.region_name_to_id[start_name]
+                    for goal_name in goal_names:
+                        if goal_name in associator.region_name_to_id:
+                            goal_id = associator.region_name_to_id[goal_name]
+                            valid_transitions_list.append((start_id, goal_id))
+            
+            VALID_TRANSITIONS_INT_IDS_local = jnp.array(valid_transitions_list)
         
-        # Use the associator to select a valid curriculum transition
-        valid_transitions_list = []
-        for start_name, goal_names in self.VALID_GOAL_MAP.items():
-            if start_name in associator.region_name_to_id:
-                start_id = associator.region_name_to_id[start_name]
-                for goal_name in goal_names:
-                    if goal_name in associator.region_name_to_id:
-                        goal_id = associator.region_name_to_id[goal_name]
-                        valid_transitions_list.append((start_id, goal_id))
+            key_select, key_loop = jr.split(key)
+            transition_idx = jr.choice(key_select, jnp.arange(VALID_TRANSITIONS_INT_IDS_local.shape[0]))
+            start_specific_id, goal_specific_id = VALID_TRANSITIONS_INT_IDS_local[transition_idx]
+            
+            initial_pos = associator.get_region_centroid(start_specific_id)
+            goal_pos = associator.get_region_centroid(goal_specific_id)
         
-        VALID_TRANSITIONS_INT_IDS_local = jnp.array(valid_transitions_list)
-        
-        key_select, key = jr.split(key)
-        transition_idx = jr.choice(key_select, jnp.arange(VALID_TRANSITIONS_INT_IDS_local.shape[0]))
-        start_specific_id, goal_specific_id = VALID_TRANSITIONS_INT_IDS_local[transition_idx]
-        
-        initial_pos = associator.get_region_centroid(start_specific_id)
-        goal_pos = associator.get_region_centroid(goal_specific_id)
-        
-        current_cluster_id = jnp.squeeze(self.associator.get_current_behavior(initial_pos))
-        
-        start_cluster_id = jnp.squeeze(self._specific_id_to_general_id[start_specific_id])
-        next_cluster_id = jnp.squeeze(self._specific_id_to_general_id[goal_specific_id])
-        
-        key = key_loop
+            current_cluster_id = jnp.squeeze(self.associator.get_current_behavior(initial_pos))
+            start_cluster_id = jnp.squeeze(self._specific_id_to_general_id[start_specific_id])
+            next_cluster_id = jnp.squeeze(self._specific_id_to_general_id[goal_specific_id])
+            
+            key = key_loop
+                    
+            agent_states_list = []
+            goal_states_list = []
+            bearings_list = []
+            current_clusters_oh_list = []
+            start_clusters_oh_list = []
+            next_clusters_oh_list = []
+            
+            for i in range(self.num_agents):
+                key_agent_pos, key_goal_pos, key_loop = jr.split(key, 3)
+                key = key_loop
+
+                # The positions are already JAX-compatible; no need to re-calculate.
+                # Only add a small random offset if desired.
+                initial_pos_agent = initial_pos + jr.normal(key_agent_pos, (2,)) * 0.025
+                goal_pos_agent = goal_pos + jr.normal(key_goal_pos, (2,)) * 0.025
                 
-        def create_agent_state(key_single_agent: jax.Array):
-            key_agent_pos, key_goal_pos = jr.split(key_single_agent, 2)
+                initial_pos_agent = jnp.clip(initial_pos_agent, 0, self.area_size)
+                goal_pos_agent = jnp.clip(goal_pos_agent, 0, self.area_size)
 
-            initial_pos_agent = initial_pos + jr.normal(key_agent_pos, (2,)) * 0.025
-            goal_pos_agent = goal_pos + jr.normal(key_goal_pos, (2,)) * 0.025
+                bearing = jnp.arctan2(goal_pos_agent[1] - initial_pos_agent[1], goal_pos_agent[0] - initial_pos_agent[0])
+                
+                # Use the consistent IDs for one-hot encoding
+                current_cluster_oh = jax.nn.one_hot(current_cluster_id, self.n_cluster)
+                start_cluster_oh = jax.nn.one_hot(start_cluster_id, self.n_cluster)
+                next_cluster_oh = jax.nn.one_hot(next_cluster_id, self.n_cluster)
+
+                agent_states_list.append(jnp.array([initial_pos_agent[0], initial_pos_agent[1], 0.0, 0.0]))
+                goal_states_list.append(jnp.array([goal_pos_agent[0], goal_pos_agent[1], 0.0, 0.0]))
+                bearings_list.append(bearing)
+                current_clusters_oh_list.append(current_cluster_oh)
+                start_clusters_oh_list.append(start_cluster_oh)
+                next_clusters_oh_list.append(next_cluster_oh)
+                
+            states = jnp.stack(agent_states_list)
+            goals = jnp.stack(goal_states_list)
+            bearing = jnp.stack(bearings_list)
+            current_clusters = jnp.stack(current_clusters_oh_list)
+            start_clusters = jnp.stack(start_clusters_oh_list)
+            next_clusters = jnp.stack(next_clusters_oh_list)
+        else:
+            print(f"Warning: No intersections found.")
             
-            initial_pos_agent = jnp.clip(initial_pos_agent, 0, self.area_size)
-            goal_pos_agent = jnp.clip(goal_pos_agent, 0, self.area_size)
-
-            bearing = jnp.arctan2(goal_pos_agent[1] - initial_pos_agent[1], goal_pos_agent[0] - initial_pos_agent[0])
-
-            agent_state = jnp.array([initial_pos_agent[0], initial_pos_agent[1], 0.0, 0.0])
-            goal_state = jnp.array([goal_pos_agent[0], goal_pos_agent[1], 0.0, 0.0])
-            
-            return agent_state, goal_state, bearing
-            
-        key_agents = jr.split(key, self.num_agents)
-        states, goals, bearing = jax.vmap(create_agent_state)(key_agents)
-
-        current_clusters = jnp.broadcast_to(
-            jax.nn.one_hot(current_cluster_id, self.n_cluster), 
-            (self.num_agents, self.n_cluster)
-        )
-        start_clusters = jnp.broadcast_to(
-            jax.nn.one_hot(start_cluster_id, self.n_cluster), 
-            (self.num_agents, self.n_cluster)
-        )
-        next_clusters = jnp.broadcast_to(
-            jax.nn.one_hot(next_cluster_id, self.n_cluster), 
-            (self.num_agents, self.n_cluster)
-        )
+        assert states.shape == (self.num_agents, self.state_dim)
+        assert goals.shape == (self.num_goals, self.state_dim)
         
         env_states = LidarEnvState(
             agent=states, 
@@ -514,9 +565,12 @@ class LidarEnv(MultiAgentEnv, ABC):
             current_cluster_oh=current_clusters,
             start_cluster_oh=start_clusters,
             next_cluster_oh=next_clusters,
-            next_cluster_bonus_awarded=jnp.zeros(self.num_agents, dtype=jnp.bool_),
+            next_cluster_bonus_awarded=initial_bonus_awarded,
             is_four_way=is_four_way_env_state,
-            intersection_params=intersection_params_env_state
+            center=inter_center_env_state,
+            passage_width=passage_width_env_state,
+            obs_len=obs_len_env_state,
+            global_angle=global_angle_env_state
         )
 
         lidar_data = self.get_lidar_data(states, obstacles)
@@ -556,16 +610,33 @@ class LidarEnv(MultiAgentEnv, ABC):
         obstacles = graph.env_states.obstacle
         
         is_four_way = graph.env_states.is_four_way
-        intersection_params = graph.env_states.intersection_params
+        inter_center = graph.env_states.center
+        passage_width = graph.env_states.passage_width
+        obs_len = graph.env_states.obs_len
+        global_angle = graph.env_states.global_angle
         bearing = graph.env_states.bearing
-
-        current_id = jax_vmap(self.associator.get_current_behavior)(agent_base_states[:, :2])
+        
+        inter_params = [(
+            inter_center,
+            passage_width,
+            obs_len,
+            global_angle,
+            is_four_way
+        )]
+        
+        associator = BehaviorIntersection(
+            intersections=inter_params,
+            all_region_names=self.ALL_POSSIBLE_REGION_NAMES
+        )
+        
+        current_id = jax_vmap(associator.get_current_behavior)(agent_base_states[:, :2])
         current_cluster_oh = jax.nn.one_hot(current_id, self.n_cluster)
         start_cluster_oh = graph.env_states.start_cluster_oh        
         next_cluster_oh = graph.env_states.next_cluster_oh
 
+        action = self.clip_action(action)
         next_agent_base_states = self.agent_step_euler(agent_base_states, action)
-        bonus_awarded_state = graph.env_states.next_cluster_bonus_awarded
+
         reward, bonus_awarded_updated = self.get_reward(graph, action) #, bonus_awarded_state)
         cost = self.get_cost(graph)
         assert reward.shape == tuple()
@@ -580,7 +651,10 @@ class LidarEnv(MultiAgentEnv, ABC):
             next_cluster_oh,
             bonus_awarded_updated,
             is_four_way=is_four_way,
-            intersection_params=intersection_params
+            center=inter_center,
+            passage_width=passage_width,
+            obs_len=obs_len,
+            global_angle=global_angle
         )
         
         lidar_data_next = self.get_lidar_data(next_agent_base_states, obstacles)
@@ -630,10 +704,12 @@ class LidarEnv(MultiAgentEnv, ABC):
     ) -> None:
         
         first_env_state = rollout.graph.env_states
-    
         intersection_params_for_render = {
             "is_four_way": first_env_state.is_four_way,
-            "intersection_params": first_env_state.intersection_params,
+            "center": first_env_state.center,
+            "passage_width": first_env_state.passage_width,
+            "obs_len": first_env_state.obs_len,
+            "global_angle": first_env_state.global_angle,
         }
         
         render_lidar(

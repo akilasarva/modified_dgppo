@@ -4,7 +4,6 @@ import numpy as np
 import jax
 import pathlib
 import functools as ft
-import jax.random as jr
 
 from colour import hsl2hex
 from matplotlib.animation import FuncAnimation
@@ -514,21 +513,22 @@ def render_lidar(
     graph0 = tree_index(rollout.graph, 0)
     first_env_state = graph0.env_states
     
-    # building_center_sim = np.array(first_env_state.building_center) if hasattr(first_env_state, 'building_center') and first_env_state.building_center is not None else np.array([0., 0.])
-    # building_width_sim = float(first_env_state.building_width) if hasattr(first_env_state, 'building_width') and first_env_state.building_width is not None else 0.0
-    # building_height_sim = float(first_env_state.building_height) if hasattr(first_env_state, 'building_height') and first_env_state.building_height is not None else 0.0
-    # building_theta_sim = float(first_env_state.building_theta) if hasattr(first_env_state, 'building_theta') and first_env_state.building_theta is not None else 0.0 # radians
+    inter_center = np.array(first_env_state.center) if hasattr(first_env_state, 'center') and first_env_state.center is not None else np.array([0., 0.])
+    inter_width = float(first_env_state.passage_width) if hasattr(first_env_state, 'passage_width') and first_env_state.passage_width is not None else 0.0
+    inter_obslen = float(first_env_state.obs_len) if hasattr(first_env_state, 'obs_len') and first_env_state.obs_len is not None else 0.0
+    inter_angle = float(first_env_state.global_angle) if hasattr(first_env_state, 'global_angle') and first_env_state.global_angle is not None else 0.0 # radians
+    inter_cond = bool(first_env_state.is_four_way) if hasattr(first_env_state, 'is_four_way') and first_env_state.is_four_way is not None else True
 
-    # buildings_for_associator = []
-    # if building_width_sim > 0.0:
-    #     buildings_for_associator = [(
-    #         building_center_sim,
-    #         building_width_sim,
-    #         building_height_sim,
-    #         building_theta_sim,
-    #     )]
+    inters_for_associator = []
+    if inter_width > 0.0:
+        inters_for_associator = [(
+            inter_center,
+            inter_width,
+            inter_obslen,
+            inter_angle,
+            inter_cond
+        )]
 
-    
     obstacles_for_associator = []
     if first_env_state.obstacle is not None:
         if isinstance(first_env_state.obstacle, Rectangle):
@@ -552,11 +552,11 @@ def render_lidar(
                 radius = float(first_env_state.obstacle.radius[i].item()) if hasattr(first_env_state.obstacle.radius[i], 'item') else float(first_env_state.obstacle.radius[i])
                 obstacles_for_associator.append(("circle", (center_x, center_y, radius)))
 
-    # behavior_associator = BehaviorIntersection(
-    #     buildings=buildings_for_associator,
-    #     all_region_names=ALL_POSSIBLE_REGION_NAMES,
-    #     obstacles=obstacles_for_associator
-    # )
+    behavior_associator = BehaviorIntersection(
+        intersections=inters_for_associator,
+        all_region_names=ALL_POSSIBLE_REGION_NAMES,
+        obstacles=obstacles_for_associator
+    )
     
     # Visualize the behavior regions
     if dim == 2:

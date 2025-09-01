@@ -174,7 +174,6 @@ class LidarEnv(MultiAgentEnv, ABC):
         if self.n_cluster < len(set(self.CLUSTER_MAP.values())):
             print(f"Warning: n_cluster ({self.n_cluster}) is less than the number of unique cluster IDs in CLUSTER_MAP ({len(set(self.CLUSTER_MAP.values()))}).")
 
-        # Map integer IDs back to *base* string names (e.g., 0 -> "open_space", not "open_space_0")
         self._id_to_curriculum_prefix_map: Dict[int, str] = {v: k for k, v in self.CLUSTER_MAP.items()}
         
         allowed_id_transitions_list: List[Tuple[int, int]] = []
@@ -241,8 +240,6 @@ class LidarEnv(MultiAgentEnv, ABC):
             self.CLUSTER_MAP.get(self._SPECIFIC_TO_GENERAL_MAP.get(name)) for name in sorted_unique_names
         ], dtype=jnp.int32)
         
-    # In your LidarEnv class
-
     def _prepare_transition_centroids(self):
         # This method is called from __init__
         valid_transitions_list = []
