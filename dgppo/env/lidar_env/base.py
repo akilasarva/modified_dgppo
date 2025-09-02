@@ -530,7 +530,7 @@ class LidarEnv(MultiAgentEnv, ABC):
             key_loop, key_goal_pos = jr.split(key_loop)
             goal_pos = self._get_initial_position(key_goal_pos, associator, goal_specific_id)
             
-            jd.print("current: {}, start: {}, end: {}", start_cluster_id, start_cluster_id, next_cluster_id)
+            #jd.print("current: {}, start: {}, end: {}", start_cluster_id, start_cluster_id, next_cluster_id)
             
             agent_states_list = []
             goal_states_list = []
@@ -540,13 +540,29 @@ class LidarEnv(MultiAgentEnv, ABC):
             next_clusters_oh_list = []
             
             for i in range(self.num_agents):
-                key_agent_pos, key_goal_pos, key_loop = jr.split(key_loop, 3)
+                key_agent_pos, key_goal_pos, key_rot, key_loop = jr.split(key_loop, 4)
 
                 initial_pos_agent = initial_pos + jr.normal(key_agent_pos, (2,)) * 0.025
                 goal_pos_agent = goal_pos + jr.normal(key_goal_pos, (2,)) * 0.025
                 
                 initial_pos_agent = jnp.clip(initial_pos_agent, 0, self.area_size)
                 goal_pos_agent = jnp.clip(goal_pos_agent, 0, self.area_size)
+
+                rot_angle = jr.uniform(key_rot, (), minval=-jnp.pi/4, maxval=jnp.pi/4)
+
+                cos_rot = jnp.cos(rot_angle)
+                sin_rot = jnp.sin(rot_angle)
+                
+                rotation_matrix = jnp.array([
+                    [cos_rot, -sin_rot],
+                    [sin_rot, cos_rot]
+                ])
+
+                goal_pos_relative = goal_pos_agent - inter_center_env_state
+                rotated_goal_pos_relative = jnp.dot(rotation_matrix, goal_pos_relative)
+                rotated_goal_pos = inter_center_env_state + rotated_goal_pos_relative
+                
+                goal_pos_agent = rotated_goal_pos
 
                 bearing = jnp.arctan2(goal_pos_agent[1] - initial_pos_agent[1], goal_pos_agent[0] - initial_pos_agent[0])
                 
@@ -656,7 +672,7 @@ class LidarEnv(MultiAgentEnv, ABC):
         current_cluster_oh = jax.nn.one_hot(current_id, self.n_cluster)
         start_cluster_oh = graph.env_states.start_cluster_oh        
         next_cluster_oh = graph.env_states.next_cluster_oh
-
+        #jd.print("current:{}, start: {}, end: {}", current_id, jnp.argmax(start_cluster_oh), jnp.argmax(next_cluster_oh))
         action = self.clip_action(action)
         next_agent_base_states = self.agent_step_euler(agent_base_states, action)
 
