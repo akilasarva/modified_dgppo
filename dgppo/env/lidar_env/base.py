@@ -52,64 +52,62 @@ class LidarEnvState(NamedTuple):
 LidarEnvGraphsTuple = GraphsTuple[State, LidarEnvState]
 
 def create_fourway_intersection(
-    center: jnp.ndarray,
+    area_size: float,
     passage_width: float,
     obs_len: float,
     global_angle: float
 ) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
-
-    half_passage = passage_width / 2.0
-    offset = obs_len / 2.0 + half_passage
-
-    obs_pos_local = jnp.array([
-        [-offset, 0.0], [offset, 0.0], [0.0, offset], [0.0, -offset]
+    """
+    Generates four obstacles, with each one centered directly on a corner of the grid.
+    The corners are defined as (0, 0), (area_size, 0), (0, area_size), and (area_size, area_size).
+    """
+    # The positions are now the absolute corner coordinates.
+    # The passage_width and obs_len are used for obstacle dimensions, not for position offsets.
+    obs_pos = jnp.array([
+        [0.0, 0.0],
+        [area_size, 0.0],
+        [0.0, area_size],
+        [area_size, area_size]
     ])
 
     obs_len_x = jnp.array([obs_len, obs_len, obs_len, obs_len])
     obs_len_y = jnp.array([obs_len, obs_len, obs_len, obs_len])
+    
+    # The angles are set to align the obstacles with the axes at each corner.
     obs_theta = jnp.array([0.0, 0.0, jnp.pi / 2.0, jnp.pi / 2.0])
 
-    cos_a, sin_a = jnp.cos(global_angle), jnp.sin(global_angle)
-    rotation_matrix = jnp.array([[cos_a, -sin_a], [sin_a, cos_a]])
-    rotated_obs_pos = jnp.einsum('ij,kj->ki', rotation_matrix, obs_pos_local)
-    rotated_obs_pos += center
+    # No rotation or translation is needed since the positions are absolute.
+    rotated_obs_pos = obs_pos
     rotated_obs_theta = obs_theta + global_angle
 
     return rotated_obs_pos, obs_len_x, obs_len_y, rotated_obs_theta
 
 def create_threeway_intersection(
-    center: jnp.ndarray,
+    area_size: jnp.ndarray,
     passage_width: float,
     obs_len: float,
     global_angle: float
 ) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    """
+    Generates a three-way intersection with one large obstacle covering two adjacent corners
+    and two smaller obstacles covering the other two corners.
+    """
+    obs_pos = jnp.array([
+        [area_size/2, 0.0],  # Large obstacle (centered later)
+        [0.0, area_size], # Small obstacle 1
+        [area_size, area_size] # Small obstacle 2
+    ])
+
+    # Define the dimensions (lengths) for the three obstacles
+    obs_len_x = jnp.array([area_size*2, obs_len, obs_len])
+    obs_len_y = jnp.array([obs_len/2, obs_len, obs_len])
     
-    half_passage = passage_width / 2.0
-    diag_len = jnp.sqrt((obs_len + half_passage)**2 + (half_passage)**2)
-    
-    pos1_local = jnp.array([0, -obs_len/2 - half_passage])
-    
-    angle2 = jnp.pi * 5 / 6
-    pos2_local = jnp.array([diag_len * jnp.cos(angle2), diag_len * jnp.sin(angle2)])
-    
-    angle3 = jnp.pi * 1 / 6
-    pos3_local = jnp.array([diag_len * jnp.cos(angle3), diag_len * jnp.sin(angle3)])
-    
-    obs_pos_local = jnp.stack([pos1_local, pos2_local, pos3_local])
-    
-    obs_len_x = jnp.array([obs_len, diag_len * 2, diag_len * 2])
-    obs_len_y = jnp.array([obs_len, obs_len, obs_len])
-    
-    theta1 = jnp.pi / 2
-    theta2 = angle2 + jnp.pi / 2
-    theta3 = angle3 + jnp.pi / 2
-    obs_theta_local = jnp.stack([theta1, theta2, theta3])
-    
-    cos_a, sin_a = jnp.cos(global_angle), jnp.sin(global_angle)
-    rotation_matrix = jnp.array([[cos_a, -sin_a], [sin_a, cos_a]])
-    rotated_obs_pos = jnp.einsum('ij,kj->ki', rotation_matrix, obs_pos_local)
-    rotated_obs_pos += center
-    rotated_obs_theta = obs_theta_local + global_angle
+    # Define the local angles for the obstacles
+    obs_theta = jnp.array([0.0, jnp.pi / 2.0, jnp.pi / 2.0])
+
+    # No rotation or translation is needed since the positions are absolute.
+    rotated_obs_pos = obs_pos
+    rotated_obs_theta = obs_theta + global_angle
 
     return rotated_obs_pos, obs_len_x, obs_len_y, rotated_obs_theta
 
@@ -130,14 +128,14 @@ class LidarEnv(MultiAgentEnv, ABC):
         "num_intersections": 1,
         
         "is_four_way_p": 0.5, # Probability of generating a 4-way intersection (0.5 for a 50/50 chance)
-        "intersection_size_range": [0.5, 1], # Overall size of the intersection region
+        "intersection_size_range": [0.5, 0.75], # Overall size of the intersection region
         "passage_width_range": [0.25, 0.5], # Min/max for the width of the road passages
-        "obs_wall_range": [0.4, 0.75],
+        "obs_wall_range": [2, 4],
     }
     
     # In LidarEnv class
     ALL_POSSIBLE_REGION_NAMES = [
-        "open_space",
+        "open_space_0", "open_space_1", "open_space_2", "open_space_3",
         "in_intersection",
         "passage_0_enter", "passage_0_exit",
         "passage_1_enter", "passage_1_exit",
@@ -162,6 +160,10 @@ class LidarEnv(MultiAgentEnv, ABC):
         "passage_2_exit": "passage_exit",
         "passage_3_enter": "passage_enter",
         "passage_3_exit": "passage_exit",
+        "open_space_0": "open_space",
+        "open_space_1": "open_space",
+        "open_space_2": "open_space",
+        "open_space_3": "open_space",
         "open_space": "open_space",
         "passage_enter": "passage_enter",
         "passage_exit": "passage_exit",
@@ -177,7 +179,11 @@ class LidarEnv(MultiAgentEnv, ABC):
     
     # 3. Override _CURRICULUM_TRANSITIONS_STR for building tasks
     VALID_GOAL_MAP = {
-        "open_space": ["passage_0_enter", "passage_1_enter", "passage_2_enter", "passage_3_enter"],
+        #"open_space": ["passage_0_enter", "passage_1_enter", "passage_2_enter", "passage_3_enter"],
+        "open_space_0": ["passage_0_enter"],
+        "open_space_1": ["passage_1_enter"],
+        "open_space_2": ["passage_2_enter"],
+        "open_space_3": ["passage_3_enter"],
         "passage_0_enter": ["in_intersection"],
         "passage_1_enter": ["in_intersection"],
         "passage_2_enter": ["in_intersection"],
@@ -185,10 +191,10 @@ class LidarEnv(MultiAgentEnv, ABC):
         "in_intersection": [
             "passage_0_exit", "passage_1_exit", "passage_2_exit", "passage_3_exit"
         ],
-        "passage_0_exit": ["open_space"],
-        "passage_1_exit": ["open_space"],
-        "passage_2_exit": ["open_space"],
-        "passage_3_exit": ["open_space"]
+        "passage_0_exit": ["open_space_0"],
+        "passage_1_exit": ["open_space_1"],
+        "passage_2_exit": ["open_space_2"],
+        "passage_3_exit": ["open_space_3"]
     }
 
     def __init__(
@@ -232,7 +238,6 @@ class LidarEnv(MultiAgentEnv, ABC):
         else:
             self.CURRICULUM_TRANSITIONS_INT_IDS = jnp.empty((0, 2), dtype=jnp.int32)
 
-
         default_inter_params = [(
             jnp.array([self.area_size / 2, self.area_size / 2]),
             0.5, 0.5, 0.0, True
@@ -260,8 +265,7 @@ class LidarEnv(MultiAgentEnv, ABC):
                     if goal_name in self._name_to_id:
                         goal_id = self._name_to_id[goal_name]
                         # Exclude transitions involving open_space
-                        if start_id != self._name_to_id["open_space"] and goal_id != self._name_to_id["open_space"]:
-                            valid_transitions_list.append((start_id, goal_id))
+                        valid_transitions_list.append((start_id, goal_id))
         
         # Store the specific-to-specific transitions for the reset function
         self.VALID_TRANSITIONS_INT_IDS = jnp.array(valid_transitions_list, dtype=jnp.int32)
@@ -388,7 +392,7 @@ class LidarEnv(MultiAgentEnv, ABC):
                     minval=self._params["obs_len_range"][0],
                     maxval=self._params["obs_len_range"][1],
                 )
-                obs_theta_orig = jr.uniform(theta_key, (n_rng_obs,), minval=0, maxval=2 * jnp.pi)
+                obs_theta_orig = jr.uniform(theta_key, (n_rng_obs,), minval=0, maxval=2 *jnp.pi)
                 all_obs_pos_list.append(obs_pos_orig)
                 all_obs_len_x_list.append(obs_len_orig[:, 0])
                 all_obs_len_y_list.append(obs_len_orig[:, 1])
@@ -397,7 +401,8 @@ class LidarEnv(MultiAgentEnv, ABC):
             intersection_key, key = jr.split(key)
             is_four_way_key, center_key, theta_key, pass_key, obs_len_key = jr.split(intersection_key, 5)
 
-            is_four_way_choice = jr.choice(is_four_way_key, jnp.array([3,4]))
+            is_four_way_choice = 4 #jr.choice(is_four_way_key, jnp.array([3,4]))
+            area_size = LidarEnv.PARAMS["default_area_size"] 
             
             if num_inter > 0:
                 # inter_rand_key, key = jr.split(key)
@@ -405,16 +410,16 @@ class LidarEnv(MultiAgentEnv, ABC):
 
                 passage_width = jr.uniform(pass_key, (), minval=self._params["passage_width_range"][0], maxval=self._params["passage_width_range"][1])
                 obs_len = jr.uniform(obs_len_key, (), minval=self._params["obs_wall_range"][0], maxval=self._params["obs_wall_range"][1])
-                global_angle = jr.uniform(theta_key, (), minval=0, maxval=2 * jnp.pi)
+                global_angle = jr.uniform(theta_key, (), minval=-jnp.pi/6, maxval=jnp.pi/6)
                 
                 inter_center = jr.uniform(center_key, (2,),
-                                            minval=jnp.array([self.area_size*0.4, self.area_size*0.6]),
-                                            maxval=jnp.array([self.area_size*0.4, self.area_size*0.6]))            
+                                            minval=jnp.array([self.area_size*0.3, self.area_size*0.7]),
+                                            maxval=jnp.array([self.area_size*0.3, self.area_size*0.7]))            
                 
                 def three_way_branch(args):
                     inter_center, passage_width, obs_len, global_angle = args
                     obs_pos, obs_len_x, obs_len_y, obs_theta = create_threeway_intersection(
-                        inter_center,
+                        self.area_size,
                         passage_width,
                         obs_len,
                         global_angle
@@ -434,7 +439,7 @@ class LidarEnv(MultiAgentEnv, ABC):
                 def four_way_branch(args):
                     inter_center, passage_width, obs_len, global_angle = args
                     obs_pos, obs_len_x, obs_len_y, obs_theta = create_fourway_intersection(
-                        inter_center,
+                        self.area_size,
                         passage_width,
                         obs_len,
                         global_angle
@@ -482,11 +487,20 @@ class LidarEnv(MultiAgentEnv, ABC):
                 is_four_way_env_state
             )]
             
-            associator = BehaviorIntersection(
-                intersections=inter_params_for_associator,
-                all_region_names=self.ALL_POSSIBLE_REGION_NAMES,
-            )
-        
+            # In a real environment, you would filter the region names here
+            if is_four_way_choice == 4:
+                associator = BehaviorIntersection(
+                    intersections=inter_params_for_associator,
+                    all_region_names=self.ALL_POSSIBLE_REGION_NAMES,
+                )
+            else:
+                # Pass a filtered list of region names for a 3-way intersection
+                filtered_names = [name for name in self.ALL_POSSIBLE_REGION_NAMES if not name.startswith("passage_3_")]
+                associator = BehaviorIntersection(
+                    intersections=inter_params_for_associator,
+                    all_region_names=filtered_names,
+                )
+
             # Use the associator to select a valid curriculum transition
             valid_transitions_list = []
             for start_name, goal_names in self.VALID_GOAL_MAP.items():
@@ -503,15 +517,21 @@ class LidarEnv(MultiAgentEnv, ABC):
             transition_idx = jr.choice(key_select, jnp.arange(VALID_TRANSITIONS_INT_IDS_local.shape[0]))
             start_specific_id, goal_specific_id = VALID_TRANSITIONS_INT_IDS_local[transition_idx]
             
-            initial_pos = associator.get_region_centroid(start_specific_id)
-            goal_pos = associator.get_region_centroid(goal_specific_id)
-        
-            current_cluster_id = jnp.squeeze(self.associator.get_current_behavior(initial_pos))
-            start_cluster_id = jnp.squeeze(self._specific_id_to_general_id[start_specific_id])
-            next_cluster_id = jnp.squeeze(self._specific_id_to_general_id[goal_specific_id])
+            # --- Start Cluster ID Logic ---
+            start_cluster_id = self._specific_id_to_general_id[start_specific_id]
             
-            key = key_loop
-                    
+            # Get the initial position based on the start region
+            initial_pos = self._get_initial_position(key_loop, associator, start_specific_id)
+
+            # --- Goal Cluster ID Logic ---
+            next_cluster_id = self._specific_id_to_general_id[goal_specific_id]
+            
+            # Get the goal position based on the goal region
+            key_loop, key_goal_pos = jr.split(key_loop)
+            goal_pos = self._get_initial_position(key_goal_pos, associator, goal_specific_id)
+            
+            jd.print("current: {}, start: {}, end: {}", start_cluster_id, start_cluster_id, next_cluster_id)
+            
             agent_states_list = []
             goal_states_list = []
             bearings_list = []
@@ -520,11 +540,8 @@ class LidarEnv(MultiAgentEnv, ABC):
             next_clusters_oh_list = []
             
             for i in range(self.num_agents):
-                key_agent_pos, key_goal_pos, key_loop = jr.split(key, 3)
-                key = key_loop
+                key_agent_pos, key_goal_pos, key_loop = jr.split(key_loop, 3)
 
-                # The positions are already JAX-compatible; no need to re-calculate.
-                # Only add a small random offset if desired.
                 initial_pos_agent = initial_pos + jr.normal(key_agent_pos, (2,)) * 0.025
                 goal_pos_agent = goal_pos + jr.normal(key_goal_pos, (2,)) * 0.025
                 
@@ -533,8 +550,7 @@ class LidarEnv(MultiAgentEnv, ABC):
 
                 bearing = jnp.arctan2(goal_pos_agent[1] - initial_pos_agent[1], goal_pos_agent[0] - initial_pos_agent[0])
                 
-                # Use the consistent IDs for one-hot encoding
-                current_cluster_oh = jax.nn.one_hot(current_cluster_id, self.n_cluster)
+                current_cluster_oh = jax.nn.one_hot(start_cluster_id, self.n_cluster)
                 start_cluster_oh = jax.nn.one_hot(start_cluster_id, self.n_cluster)
                 next_cluster_oh = jax.nn.one_hot(next_cluster_id, self.n_cluster)
 
@@ -551,6 +567,8 @@ class LidarEnv(MultiAgentEnv, ABC):
             current_clusters = jnp.stack(current_clusters_oh_list)
             start_clusters = jnp.stack(start_clusters_oh_list)
             next_clusters = jnp.stack(next_clusters_oh_list)
+
+            
         else:
             print(f"Warning: No intersections found.")
             
@@ -575,7 +593,12 @@ class LidarEnv(MultiAgentEnv, ABC):
 
         lidar_data = self.get_lidar_data(states, obstacles)
         return self.get_graph(env_states, lidar_data)
-
+    
+    def _get_initial_position(self, key, associator, specific_id):
+        # The key is no longer needed since we are not adding noise at this step
+        # The `associator` now provides a valid centroid for all region types
+        return associator.get_region_centroid(specific_id)
+        
     def get_lidar_data(self, states: State, obstacles: Obstacle) -> Float[Array, "n_agent top_k_rays 2"]:
         lidar_data = None
         if self.params["n_obs"] > 0:
@@ -629,7 +652,7 @@ class LidarEnv(MultiAgentEnv, ABC):
             all_region_names=self.ALL_POSSIBLE_REGION_NAMES
         )
         
-        current_id = jax_vmap(associator.get_current_behavior)(agent_base_states[:, :2])
+        current_id = self._specific_id_to_general_id[jax_vmap(associator.get_current_behavior_direction)(agent_base_states[:, :2], agent_base_states[:, 2:4])]
         current_cluster_oh = jax.nn.one_hot(current_id, self.n_cluster)
         start_cluster_oh = graph.env_states.start_cluster_oh        
         next_cluster_oh = graph.env_states.next_cluster_oh

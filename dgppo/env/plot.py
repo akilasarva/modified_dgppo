@@ -24,7 +24,7 @@ from dgppo.env.obstacle import Cuboid, Sphere, Obstacle, Rectangle
 from dgppo.env.intersection_behavior_associator import BehaviorIntersection
 
 ALL_POSSIBLE_REGION_NAMES = [
-    "open_space",
+    "open_space_0", "open_space_1", "open_space_2", "open_space_3",
     "in_intersection",
     "passage_0_enter", "passage_0_exit",
     "passage_1_enter", "passage_1_exit",

@@ -11,7 +11,7 @@ from dgppo.env.lidar_env.base import LidarEnv, LidarEnvState, LidarEnvGraphsTupl
 from dgppo.utils.utils import jax_vmap
 
 ALL_POSSIBLE_REGION_NAMES = [
-    "open_space",
+    "open_space_0", "open_space_1", "open_space_2", "open_space_3",
     "in_intersection",
     "passage_0_enter", "passage_0_exit",
     "passage_1_enter", "passage_1_exit",
@@ -98,9 +98,9 @@ class LidarTarget(LidarEnv):
         
         "is_four_way_p": 0.5, # Probability of generating a 4-way intersection (0.5 for a 50/50 chance)
         "intersection_size_range": [0.5, 1], # Overall size of the intersection region
-        "passage_width_range": [0.25, 0.5], # Min/max for the width of the road passages
-        "obs_wall_range": [0.4, 0.75],
-        "building_theta_range": [0, 2 * jnp.pi],
+        "passage_width_range": [0.35, 0.5], # Min/max for the width of the road passages
+        "obs_wall_range": [0.8, 1],
+        "building_theta_range": [0, 0] #jnp.pi/6],
     }
 
     def __init__(

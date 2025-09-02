@@ -39,7 +39,29 @@ class BehaviorAssociator:
         self.region_name_to_id = {name: i for i, name in enumerate(self.all_region_names)}
         self.region_id_to_name = {v: k for k, v in self.region_name_to_id.items()}
         self.sorted_region_names = self.all_region_names # The list is already sorted by index
+        
+        self.passage_ids = [self.region_name_to_id[name] for name in self.all_region_names if name.startswith("passage_")]
 
+        if self.passage_ids:
+            # These are the attributes that were missing
+            self.passage_start_id = jnp.array(min(self.passage_ids))
+            self.passage_end_id = jnp.array(max(self.passage_ids) + 1)
+        else:
+            # Handle the case where no passage regions exist
+            self.passage_start_id = jnp.array(-1)
+            self.passage_end_id = jnp.array(-1)
+        
+        self.id_to_curriculum_prefix_map = {}
+        for region_id, region_name in self.region_id_to_name.items():
+            if region_name.startswith("passage_"):
+                self.id_to_curriculum_prefix_map[region_id] = "passage_"
+            elif region_name == "in_intersection":
+                self.id_to_curriculum_prefix_map[region_id] = "in_intersection"
+            elif region_name.startswith("open_space_"):
+                self.id_to_curriculum_prefix_map[region_id] = "open_space"
+            else:
+                self.id_to_curriculum_prefix_map[region_id] = region_name
+                
     def _define_behavior_regions(self):
         raise NotImplementedError("Subclasses must implement _define_behavior_regions()")
     
@@ -244,15 +266,7 @@ class BehaviorAssociator:
             if isinstance(region, jnp.ndarray) and region.ndim == 2:
                 region_np = np.asarray(region)
                 
-                if name == "open_space":
-                    min_x = np.min(region_np[:, 0])
-                    max_x = np.max(region_np[:, 0])
-                    min_y = np.min(region_np[:, 1])
-                    max_y = np.max(region_np[:, 1])
-                    patch = plt.Rectangle((min_x, min_y), max_x - min_x, max_y - min_y,
-                                            alpha=alpha, color=color, fill=True)
-                else:
-                    patch = plt.Polygon(region_np, closed=True, alpha=alpha, color=color, fill=True)
+                patch = plt.Polygon(region_np, closed=True, alpha=alpha, color=color, fill=True)
                 
                 if label_for_legend not in added_labels:
                     patch.set_label(label_for_legend)
@@ -267,11 +281,10 @@ class BehaviorAssociator:
                     circle_patch.set_label(label_for_legend)
                     added_labels.add(label_for_legend)
                 ax.add_patch(circle_patch)
-            
-            if name != "open_space":
-                 centroid = np.asarray(self.all_region_centroids_jax_array[i])
-                 ax.text(centroid[0], centroid[1], 'o',
-                         fontsize=8, ha='center', va='center', color='black')
+
+            centroid = np.asarray(self.all_region_centroids_jax_array[i])
+            ax.text(centroid[0], centroid[1], 'o',
+                    fontsize=8, ha='center', va='center', color='black')
 
         ax.legend(loc='upper right', fontsize='small')
 

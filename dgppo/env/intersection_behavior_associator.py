@@ -28,116 +28,228 @@ class BehaviorIntersection(BehaviorAssociator):
         half_gap = passage_width / 2.0
 
         def four_way_intersection(args):
-            """Calculates regions for a four-way intersection."""
-            center, half_gap, global_angle = args
-            # Vertices of the inner intersection square, relative to a (0,0) center.
-            inner_corners_local = jnp.array([
-                [-half_gap, -half_gap],
-                [half_gap, -half_gap],
-                [half_gap, half_gap],
-                [-half_gap, half_gap]
+            """
+            Calculates regions for a four-way intersection.
+            The central and passage regions are defined by the inner corners of
+            obstacles placed at the grid's edges and rotated.
+            """
+            area_size, obs_len, global_angle = args
+            area_size = jnp.array(area_size, float)
+            obs_len = jnp.array(obs_len, float)
+            half_obs_len = obs_len / 2.0
+            
+            # Get the fixed positions of the obstacle centers
+            obs_pos = jnp.array([
+                [0.0, 0.0],
+                [area_size, 0.0],
+                [area_size, area_size],
+                [0.0, area_size]
+            ])
+
+            # Get the rotated obstacle angles
+            obs_theta = jnp.array([0.0, 0.0, jnp.pi / 2.0, jnp.pi / 2.0]) + global_angle
+
+            # FIX: The local inner corners must be geometrically correct to form the passages.
+            # This is the correct array for the inner corners.
+            local_inner_corners = jnp.array([
+                [half_obs_len, half_obs_len],    # Obstacle at (0, 0)
+                [-half_obs_len, half_obs_len],   # Obstacle at (area_size, 0)
+                [-half_obs_len, -half_obs_len],  # Obstacle at (area_size, area_size)
+                [half_obs_len, -half_obs_len]    # Obstacle at (0, area_size)
             ])
             
-            # Rotation matrix for the global angle
+            # Create a single rotation matrix for the global angle
             cos_a, sin_a = jnp.cos(global_angle), jnp.sin(global_angle)
             rotation_matrix = jnp.array([[cos_a, -sin_a], [sin_a, cos_a]])
             
-            # Rotate and translate the central square
-            rotated_corners = jnp.einsum('ij,kj->ki', rotation_matrix, inner_corners_local)
-            in_intersection_region = rotated_corners + center
-            
-            # Define and transform the passage regions (trapezoids)
-            passage_0_local = jnp.array([[-half_gap, half_gap], [half_gap, half_gap], [half_gap, 50], [-half_gap, 50]])
-            passage_1_local = jnp.array([[half_gap, -half_gap], [half_gap, half_gap], [50, half_gap], [50, -half_gap]])
-            passage_2_local = jnp.array([[-half_gap, -half_gap], [half_gap, -half_gap], [half_gap, -50], [-half_gap, -50]])
-            passage_3_local = jnp.array([[-half_gap, -half_gap], [-half_gap, half_gap], [-50, half_gap], [-50, -half_gap]])
+            # Use einsum to efficiently rotate and translate all four corners
+            rotated_in_intersection = (jnp.einsum('ij,kj->ki', rotation_matrix, local_inner_corners) + obs_pos)
 
+            # NEW: Define passage regions based on inner corners and an outward extension
+            passage_len = 0.3  # Length of the passage polygon, as requested
+            outward_vectors_local = jnp.array([
+                [0.0, -1.0],  # Bottom passage direction
+                [1.0, 0.0],  # Left passage direction
+                [0.0, 1.0],   # Right passage direction
+                [-1.0, 0.0]    # Top passage direction
+            ])
+            # The local passages are trapezoids defined by two inner corners and two new points
+            # created by extending outwards.
+            # Bottom Passage (connecting inner corners of obstacles 0 and 1)
+            rotated_outward_vectors = jnp.einsum('ij,kj->ki', rotation_matrix, outward_vectors_local)
+
+            # Construct the passage polygons directly from the rotated_in_intersection vertices
             rotated_passages = jnp.stack([
-                jnp.einsum('ij,kj->ki', rotation_matrix, p) + center for p in [
-                    passage_0_local, passage_1_local, passage_2_local, passage_3_local
-                ]
+                jnp.array([
+                    rotated_in_intersection[0],
+                    rotated_in_intersection[1],
+                    rotated_in_intersection[1] + rotated_outward_vectors[0] * passage_len,
+                    rotated_in_intersection[0] + rotated_outward_vectors[0] * passage_len
+                ]),
+                jnp.array([
+                    rotated_in_intersection[1],
+                    rotated_in_intersection[2],
+                    rotated_in_intersection[2] + rotated_outward_vectors[1] * passage_len,
+                    rotated_in_intersection[1] + rotated_outward_vectors[1] * passage_len
+                ]),
+                jnp.array([
+                    rotated_in_intersection[2],
+                    rotated_in_intersection[3],
+                    rotated_in_intersection[3] + rotated_outward_vectors[2] * passage_len,
+                    rotated_in_intersection[2] + rotated_outward_vectors[2] * passage_len
+                ]),
+                jnp.array([
+                    rotated_in_intersection[3],
+                    rotated_in_intersection[0],
+                    rotated_in_intersection[0] + rotated_outward_vectors[3] * passage_len,
+                    rotated_in_intersection[3] + rotated_outward_vectors[3] * passage_len
+                ])
             ])
             
-            return in_intersection_region, rotated_passages
+            open_space_len = 0.45
+            open_space_polygons = jnp.stack([
+                jnp.array([
+                    rotated_passages[0][2],
+                    rotated_passages[0][3],
+                    rotated_passages[0][3] + rotated_outward_vectors[0] * open_space_len,
+                    rotated_passages[0][2] + rotated_outward_vectors[0] * open_space_len
+                ]),
+                jnp.array([
+                    rotated_passages[1][2],
+                    rotated_passages[1][3],
+                    rotated_passages[1][3] + rotated_outward_vectors[1] * open_space_len,
+                    rotated_passages[1][2] + rotated_outward_vectors[1] * open_space_len
+                ]),
+                jnp.array([
+                    rotated_passages[2][2],
+                    rotated_passages[2][3],
+                    rotated_passages[2][3] + rotated_outward_vectors[2] * open_space_len,
+                    rotated_passages[2][2] + rotated_outward_vectors[2] * open_space_len
+                ]),
+                jnp.array([
+                    rotated_passages[3][2],
+                    rotated_passages[3][3],
+                    rotated_passages[3][3] + rotated_outward_vectors[3] * open_space_len,
+                    rotated_passages[3][2] + rotated_outward_vectors[3] * open_space_len
+                ])
+            ])
 
+            return rotated_in_intersection, rotated_passages, open_space_polygons
+        
         def three_way_intersection(args):
-            """Calculates regions for a three-way intersection and pads the output."""
-            center, half_gap, global_angle, obs_len, passage_width = args
-            # Define the vertices for the central trapezoid, relative to a (0,0) center.
-            long_obs_len = obs_len + passage_width + obs_len
-            inner_corners_local = jnp.array([
-                [-long_obs_len / 2.0, obs_len / 2.0],
-                [long_obs_len / 2.0, obs_len / 2.0],
-                [half_gap, -obs_len / 2.0],
-                [-half_gap, -obs_len / 2.0]
+            """
+            Calculates regions for a three-way intersection using the specified logic.
+            """
+            area_size, obs_len, global_angle = args
+            half_obs_len = obs_len / 2.0
+
+            grid_corners = jnp.array([
+                [0.0, 0.0],
+                [area_size, 0.0],
+                [area_size, area_size],
+                [0.0, area_size]
             ])
 
-            # Rotation matrix for the global angle
+            # Determine the inner corners for the central region
+            # This is a trapezoid connecting the inner corners of the three effective obstacles.
+
+            # Inner corner of small obstacle at top-left (grid_corners[3])
+            c3_inner = grid_corners[3] + jnp.array([half_obs_len, -half_obs_len])
+            
+            # Inner corner of small obstacle at top-right (grid_corners[2])
+            c2_inner = grid_corners[2] + jnp.array([-half_obs_len, -half_obs_len])
+            
+            # Inner corner of the large obstacle (effectively from grid_corners[0] and grid_corners[1])
+            # The bottom edge of the central region will be from (0 + half_obs_len, 0 + half_obs_len)
+            # to (area_size - half_obs_len, 0 + half_obs_len)
+            
+            c0_inner_for_large_obs = grid_corners[0] + jnp.array([half_obs_len, half_obs_len])
+            c1_inner_for_large_obs = grid_corners[1] + jnp.array([-half_obs_len, half_obs_len])
+            
+            in_intersection_region = jnp.array([
+                c3_inner,  # Top-left vertex of trapezoid
+                c2_inner,  # Top-right vertex of trapezoid
+                c1_inner_for_large_obs, # Bottom-right vertex of trapezoid
+                c0_inner_for_large_obs  # Bottom-left vertex of trapezoid
+            ])
+
+            # Define the three outward-facing passages using the central region's vertices
+            passage_len = 0.25
+            
+            # Outward vectors for the three passages (Left, Right, Bottom)
+            # Note: The order here corresponds to how we'll extract the sides from in_intersection_region
+            outward_vectors_local = jnp.array([
+                [-1.0, 0.0],   # Left passage direction
+                [1.0, 0.0],    # Right passage direction
+                [0.0, -1.0]    # Bottom passage direction
+            ])
+            
             cos_a, sin_a = jnp.cos(global_angle), jnp.sin(global_angle)
             rotation_matrix = jnp.array([[cos_a, -sin_a], [sin_a, cos_a]])
+            rotated_outward_vectors = jnp.einsum('ij,kj->ki', rotation_matrix, outward_vectors_local)
 
-            rotated_corners = jnp.einsum('ij,kj->ki', rotation_matrix, inner_corners_local)
-            in_intersection_region = rotated_corners + center
-
-            # NOTE: The shapes of these arrays must all be the same (4 vertices per passage)
-            passage_0_local = jnp.array([
-                [-half_gap, -obs_len / 2.0], 
-                [half_gap, -obs_len / 2.0], 
-                [half_gap, -50], 
-                [-half_gap, -50]
-            ])
-            
-            # Corrected passage arrays to have 4 vertices
-            passage_1_local = jnp.array([
-                [-long_obs_len / 2.0, obs_len / 2.0], 
-                [-50, 50], 
-                [-50, obs_len / 2.0],
-                [-long_obs_len / 2.0, obs_len / 2.0] # Duplicate vertex to make it a quad
-            ])
-            passage_2_local = jnp.array([
-                [long_obs_len / 2.0, obs_len / 2.0], 
-                [50, 50], 
-                [50, obs_len / 2.0],
-                [long_obs_len / 2.0, obs_len / 2.0] # Duplicate vertex to make it a quad
-            ])
-            
-            # Pad the output with a "dummy" passage to match the four-way output shape
-            # The dummy passage should also have 4 vertices
-            dummy_passage = jnp.zeros_like(passage_0_local) 
+            # Construct the passage polygons
             rotated_passages = jnp.stack([
-                jnp.einsum('ij,kj->ki', rotation_matrix, p) + center for p in [
-                    passage_0_local, passage_1_local, passage_2_local, dummy_passage
-                ]
+                jnp.array([ # Left passage (connects c3_inner and c0_inner_for_large_obs)
+                    in_intersection_region[0], # c3_inner
+                    in_intersection_region[3], # c0_inner_for_large_obs
+                    in_intersection_region[3] + rotated_outward_vectors[0] * passage_len,
+                    in_intersection_region[0] + rotated_outward_vectors[0] * passage_len
+                ]),
+                jnp.array([ # Right passage (connects c2_inner and c1_inner_for_large_obs)
+                    in_intersection_region[1], # c2_inner
+                    in_intersection_region[2], # c1_inner_for_large_obs
+                    in_intersection_region[2] + rotated_outward_vectors[1] * passage_len,
+                    in_intersection_region[1] + rotated_outward_vectors[1] * passage_len
+                ]),
+                jnp.array([ # Bottom passage (connects c0_inner_for_large_obs and c1_inner_for_large_obs)
+                    in_intersection_region[3], # c0_inner_for_large_obs
+                    in_intersection_region[2], # c1_inner_for_large_obs
+                    in_intersection_region[2] + rotated_outward_vectors[2] * passage_len,
+                    in_intersection_region[3] + rotated_outward_vectors[2] * passage_len
+                ]),
+                jnp.zeros((4, 2)) # Dummy passage for consistency with 4-way output
             ])
             
-            return in_intersection_region, rotated_passages
+            # Apply global rotation and translation
+            rotated_in_intersection = jnp.einsum('ij,kj->ki', rotation_matrix, in_intersection_region - center) + center
+            rotated_passages = jnp.einsum('ij,kj->ki', rotation_matrix, rotated_passages.reshape(-1, 2) - center) + center
+            rotated_passages = rotated_passages.reshape(4, 4, 2)
 
+            return rotated_in_intersection, rotated_passages, rotated_passages
+        
         # Use jax.lax.cond as before
-        in_intersection_region, rotated_passages = jax.lax.cond(
+        in_intersection, passage_polygons, open_space_polygons = jax.lax.cond(
             is_four_way,
-            partial(four_way_intersection, args=(center, half_gap, global_angle)),
-            partial(three_way_intersection, args=(center, half_gap, global_angle, obs_len, passage_width))
+            four_way_intersection,
+            three_way_intersection,
+            (1.5, obs_len, global_angle)
         )
 
         regions = {}
-        regions["open_space"] = jnp.array([(0, 0), (50, 0), (50, 50), (0, 50)], dtype=jnp.float32)
-        regions["in_intersection"] = in_intersection_region
-        
-        for i, passage in enumerate(rotated_passages):
-            regions[f"passage_{i}_enter"] = regions[f"passage_{i}_exit"] = passage
+        regions["in_intersection"] = in_intersection
 
+        for i, passage in enumerate(passage_polygons):
+            # Assign specific passage polygons to both enter and exit
+            regions[f"passage_{i}_enter"] = passage_polygons[i]
+            regions[f"passage_{i}_exit"] = passage_polygons[i]
+            
+            # Assign the corresponding open_space polygon
+            regions[f"open_space_{i}"] = open_space_polygons[i]
+            
         return regions
 
     def _get_region_visualization_properties(self) -> Dict[str, Dict[str, Any]]:
         properties = {
             "in_intersection": {"label": "Intersection", "color": "darkorange", "alpha": 0.8},
-            "open_space": {"label": "Open Space", "color": "lightgray", "alpha": 0.1},
         }
         is_four_way = self.intersections[0][4]
         num_passages = 4 if is_four_way else 3
         for p in range(num_passages):
             properties[f"passage_{p}_enter"] = {"label": f"Passage {p} Enter", "color": "lightblue", "alpha": 0.5}
             properties[f"passage_{p}_exit"] = {"label": f"Passage {p} Exit", "color": "lightgreen", "alpha": 0.5}
+            properties[f"open_space_{p}"] = {"label": f"Open Space {p}", "color": "yellow", "alpha": 0.1}
+
         return properties
 
     @partial(jax.jit, static_argnums=(0,))
@@ -159,11 +271,14 @@ class BehaviorIntersection(BehaviorAssociator):
         dot_product = jnp.dot(vel, vec_to_centroid)
         is_moving_towards = dot_product > 0.01 
         
+        # Determine if the current region is a passage using JAX-compatible logic
+        is_passage = jnp.logical_and(current_region_id >= self.passage_start_id, current_region_id < self.passage_end_id)
+        
         final_id = lax.cond(
             current_region_id == in_intersection_id,
             lambda: in_intersection_id,
             lambda: lax.cond(
-                self.id_to_curriculum_prefix_map.get(current_region_id, "").startswith("passage_"),
+                is_passage,
                 lambda: self._get_enter_exit_id(current_region_id, is_moving_towards),
                 lambda: current_region_id
             )
@@ -171,8 +286,11 @@ class BehaviorIntersection(BehaviorAssociator):
         return final_id
 
     def _get_enter_exit_id(self, passage_id, is_moving_towards):
-        base_name = self.id_to_curriculum_prefix_map.get(passage_id, "")
-        enter_id = self.region_name_to_id.get(base_name + "_enter", -1)
-        exit_id = self.region_name_to_id.get(base_name + "_exit", -1)
+        base_passage_idx = (passage_id - self.passage_start_id) // 2
         
-        return lax.cond(is_moving_towards, lambda: enter_id, lambda: exit_id)
+        # Calculate the IDs for both enter and exit
+        enter_id = self.passage_start_id + base_passage_idx * 2
+        exit_id = self.passage_start_id + base_passage_idx * 2 + 1
+        
+        # Use jnp.where to choose the correct ID based on the condition
+        return jnp.where(is_moving_towards, enter_id, exit_id)
