@@ -140,7 +140,7 @@ class LidarTarget(LidarEnv):
             0.0 # If in the next cluster, the reward is 0.0
         ).mean()
         reward = dense_reward * self.COSINE_SIM_REWARD_COEFF
-        #jdebug.print("dense: {}", reward)
+        jdebug.print("dense: {}", reward)
 
         is_building_env = env_states.building_width > 0.0
         
@@ -164,12 +164,12 @@ class LidarTarget(LidarEnv):
         next_cluster_bonus_awarded_updated = jnp.where(is_building_env, per_agent_bonus_awarded_updated, bonus_awarded_state)
 
         reward += jnp.mean(reward_cluster)
-        #jdebug.print("cluster: {}", jnp.mean(reward_cluster))
+        jdebug.print("cluster: {}", jnp.mean(reward_cluster))
 
         velocity_magnitude_sq = jnp.linalg.norm(agent_vel, axis=1) ** 2
         velocity_penalty = jnp.where(is_in_next_cluster, velocity_magnitude_sq, 0.0).mean()
         reward += velocity_penalty * self.VELOCITY_PENALTY_IN_CLUSTER
-        #jdebug.print("vel: {}", velocity_penalty * self.VELOCITY_PENALTY_IN_CLUSTER)
+        jdebug.print("vel: {}", velocity_penalty * self.VELOCITY_PENALTY_IN_CLUSTER)
         
         reward -= (jnp.linalg.norm(action, axis=1) ** 2).mean() * 0.001
 

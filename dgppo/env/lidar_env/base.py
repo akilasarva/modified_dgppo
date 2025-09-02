@@ -472,7 +472,7 @@ class LidarEnv(MultiAgentEnv, ABC):
             next_clusters_oh_list = []
             
             for i in range(self.num_agents):
-                key_agent_pos, key_goal_pos, key_loop = jr.split(key, 3)
+                key_agent_pos, key_goal_pos, key_rot, key_loop = jr.split(key, 4)
                 key = key_loop
 
                 initial_pos_agent = initial_pos + jr.normal(key_agent_pos, (2,)) * 0.025
@@ -480,6 +480,23 @@ class LidarEnv(MultiAgentEnv, ABC):
                 
                 initial_pos_agent = jnp.clip(initial_pos_agent, 0, self.area_size)
                 goal_pos_agent = jnp.clip(goal_pos_agent, 0, self.area_size)
+
+                rot_angle = jr.uniform(key_rot, (), minval=-jnp.pi/4, maxval=jnp.pi/4)
+
+                cos_rot = jnp.cos(rot_angle)
+                sin_rot = jnp.sin(rot_angle)
+                
+                rotation_matrix = jnp.array([
+                    [cos_rot, -sin_rot],
+                    [sin_rot, cos_rot]
+                ])
+
+                goal_pos_relative = goal_pos_agent - building_center_env_state
+                rotated_goal_pos_relative = jnp.dot(rotation_matrix, goal_pos_relative)
+                rotated_goal_pos = building_center_env_state + rotated_goal_pos_relative
+                
+                goal_pos_agent = rotated_goal_pos
+
 
                 bearing = jnp.arctan2(goal_pos_agent[1] - initial_pos_agent[1], goal_pos_agent[0] - initial_pos_agent[0])
                 
@@ -592,10 +609,11 @@ class LidarEnv(MultiAgentEnv, ABC):
             buildings=building_params,
             all_region_names=self.ALL_POSSIBLE_REGION_NAMES
         )
-        current_id = jax_vmap(associator.get_current_behavior)(agent_base_states[:, :2])
+        current_id = self._specific_id_to_general_id[jax_vmap(associator.get_current_behavior)(agent_base_states[:, :2])]
         current_cluster_oh = jax.nn.one_hot(current_id, self.n_cluster)
         start_cluster_oh = graph.env_states.start_cluster_oh
         next_cluster_oh = graph.env_states.next_cluster_oh
+        jd.print("current: {}, start: {}, end: {}", current_id, jnp.argmax(start_cluster_oh, axis=-1),  jnp.argmax(next_cluster_oh, axis=-1))
 
         # calculate next states
         action = self.clip_action(action)
