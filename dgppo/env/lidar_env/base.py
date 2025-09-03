@@ -672,7 +672,7 @@ class LidarEnv(MultiAgentEnv, ABC):
         current_cluster_oh = jax.nn.one_hot(current_id, self.n_cluster)
         start_cluster_oh = graph.env_states.start_cluster_oh        
         next_cluster_oh = graph.env_states.next_cluster_oh
-        #jd.print("current:{}, start: {}, end: {}", current_id, jnp.argmax(start_cluster_oh), jnp.argmax(next_cluster_oh))
+        jd.print("current:{}, start: {}, end: {}", current_id, jnp.argmax(start_cluster_oh), jnp.argmax(next_cluster_oh))
         action = self.clip_action(action)
         next_agent_base_states = self.agent_step_euler(agent_base_states, action)
 
