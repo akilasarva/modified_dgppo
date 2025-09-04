@@ -445,15 +445,8 @@ class LidarEnv(MultiAgentEnv, ABC):
                 current_cluster_oh = jax.nn.one_hot(current_cluster_idx, self.n_cluster)
                 start_cluster_oh = jax.nn.one_hot(start_cluster_idx, self.n_cluster)
                 next_cluster_oh = jax.nn.one_hot(next_cluster_idx, self.n_cluster)
-                
-                theta_init = bearing
-        
-                cos_theta = jnp.cos(theta_init)
-                sin_theta = jnp.sin(theta_init)
-                
-                # Agent state: [x, y, cos_theta, sin_theta]
-                agent_states_list.append(jnp.array([initial_pos[0], initial_pos[1], cos_theta, sin_theta]))
-                
+
+                agent_states_list.append(jnp.array([initial_pos[0], initial_pos[1], 0.0, 0.0]))
                 goal_states_list.append(jnp.array([goal_pos[0], goal_pos[1], 0.0, 0.0]))
                 bearings_list.append(bearing)
                 current_clusters_oh_list.append(current_cluster_oh)
@@ -530,39 +523,6 @@ class LidarEnv(MultiAgentEnv, ABC):
         n_state_agent_new = x_dot * self.dt + agent_states
         assert n_state_agent_new.shape == (self.num_agents, self.state_dim)
         return self.clip_state(n_state_agent_new)
-    
-    def agent_step_unicycle(self, agent_states: AgentState, action: Action) -> AgentState:
-        """
-        Implements unicycle dynamics:
-        State: [x, y, cos_theta, sin_theta]
-        Action: [omega, v]
-        """
-        assert action.shape == (self.num_agents, self.action_dim)
-        assert agent_states.shape == (self.num_agents, self.state_dim)
-
-        # Unpack state and action
-        x, y, cos_theta, sin_theta = agent_states[:, 0], agent_states[:, 1], agent_states[:, 2], agent_states[:, 3]
-        omega, v = action[:, 0], action[:, 1]
-        
-        # The new state derivatives
-        x_dot = v * cos_theta
-        y_dot = v * sin_theta
-        
-        # The derivatives of cos_theta and sin_theta
-        cos_theta_dot = -omega * sin_theta
-        sin_theta_dot = omega * cos_theta
-        
-        # Combine the derivatives for the update
-        state_dot = jnp.stack([x_dot, y_dot, cos_theta_dot, sin_theta_dot], axis=1)
-
-        # Euler integration
-        next_agent_states = agent_states + state_dot * self.dt
-
-        # Re-normalize the (cos, sin) components to ensure they stay on the unit circle
-        norm = jnp.linalg.norm(next_agent_states[:, 2:], axis=1, keepdims=True)
-        next_agent_states = next_agent_states.at[:, 2:].divide(norm)
-        
-        return self.clip_state(next_agent_states)
 
     def step(
             self, graph: LidarEnvGraphsTuple, action: Action, get_eval_info: bool = False
@@ -612,7 +572,7 @@ class LidarEnv(MultiAgentEnv, ABC):
 
         # calculate next states
         action = self.clip_action(action)
-        next_agent_base_states = self.agent_step_unicycle(agent_base_states, action) 
+        next_agent_base_states = self.agent_step_euler(agent_base_states, action) # Only update (x,y,vx,vy)
         
         reward, bonus_awarded_updated = self.get_reward(graph, action)
         cost = self.get_cost(graph)
@@ -779,11 +739,11 @@ class LidarEnv(MultiAgentEnv, ABC):
         ).to_padded()
     
     def state_lim(self, state: Optional[State] = None) -> Tuple[State, State]:
-        lower_lim = jnp.array([0., 0., -1, -1])
-        upper_lim = jnp.array([self.area_size, self.area_size, 1, 1])
+        lower_lim = jnp.array([0., 0., -0.5, -0.5])
+        upper_lim = jnp.array([self.area_size, self.area_size, 0.5, 0.5])
         return lower_lim, upper_lim
 
     def action_lim(self) -> Tuple[Action, Action]:
-        lower_lim = jnp.array([-5.0, 0.0])
-        upper_lim = jnp.array([5.0, 1.0])  
+        lower_lim = jnp.ones(2) * -1.0
+        upper_lim = jnp.ones(2)
         return lower_lim, upper_lim
