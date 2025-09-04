@@ -79,8 +79,8 @@ def _calculate_cluster_reward_per_agent(
 
 class LidarTarget(LidarEnv):
 
-    COSINE_SIM_REWARD_COEFF = 0.1
-    NEXT_CLUSTER_BONUS = 4.0      # Significant bonus for reaching target cluster
+    COSINE_SIM_REWARD_COEFF = 0.075
+    NEXT_CLUSTER_BONUS = 10.0      # Significant bonus for reaching target cluster
     INCORRECT_CLUSTER_PENALTY = -2.0 # Large penalty for moving to an unauthorized cluster
     STAY_IN_CLUSTER_BONUS = 0.2 # A small, continuous bonus for staying in the target cluster
     VELOCITY_PENALTY_IN_CLUSTER = -2
