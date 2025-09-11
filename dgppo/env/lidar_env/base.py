@@ -128,9 +128,9 @@ class LidarEnv(MultiAgentEnv, ABC):
         "num_intersections": 1,
         
         "is_four_way_p": 0.5, # Probability of generating a 4-way intersection (0.5 for a 50/50 chance)
-        "intersection_size_range": [0.5, 0.75], # Overall size of the intersection region
-        "passage_width_range": [0.25, 0.5], # Min/max for the width of the road passages
-        "obs_wall_range": [2, 4],
+        "intersection_size_range": [0.35, 0.5], # Overall size of the intersection region
+        "passage_width_range": [0.35, 0.5], # Min/max for the width of the road passages
+        "obs_wall_range": [3, 4.5],
     }
     
     # In LidarEnv class
@@ -410,7 +410,7 @@ class LidarEnv(MultiAgentEnv, ABC):
 
                 passage_width = jr.uniform(pass_key, (), minval=self._params["passage_width_range"][0], maxval=self._params["passage_width_range"][1])
                 obs_len = jr.uniform(obs_len_key, (), minval=self._params["obs_wall_range"][0], maxval=self._params["obs_wall_range"][1])
-                global_angle = jr.uniform(theta_key, (), minval=-jnp.pi/6, maxval=jnp.pi/6)
+                global_angle = jr.uniform(theta_key, (), minval=-jnp.pi/8, maxval=jnp.pi/8)
                 
                 inter_center = jr.uniform(center_key, (2,),
                                             minval=jnp.array([self.area_size*0.3, self.area_size*0.7]),
@@ -548,7 +548,7 @@ class LidarEnv(MultiAgentEnv, ABC):
                 initial_pos_agent = jnp.clip(initial_pos_agent, 0, self.area_size)
                 goal_pos_agent = jnp.clip(goal_pos_agent, 0, self.area_size)
 
-                rot_angle = jr.uniform(key_rot, (), minval=-jnp.pi/4, maxval=jnp.pi/4)
+                rot_angle = jr.uniform(key_rot, (), minval=-jnp.pi/6, maxval=jnp.pi/6)
 
                 cos_rot = jnp.cos(rot_angle)
                 sin_rot = jnp.sin(rot_angle)

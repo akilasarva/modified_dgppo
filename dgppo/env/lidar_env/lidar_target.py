@@ -90,16 +90,16 @@ class LidarTarget(LidarEnv):
         "car_radius": 0.05,
         "comm_radius": 0.5,
         "n_rays": 32,
-        "obs_len_range": [0.25, 0.45],
+        "obs_len_range": [0.3, 0.5],
         "n_obs": 3,
         "default_area_size": 1.5,
         "dist2goal": 0.01,
         "top_k_rays": 8,
         
         "is_four_way_p": 0.5, # Probability of generating a 4-way intersection (0.5 for a 50/50 chance)
-        "intersection_size_range": [0.5, 0.7], # Overall size of the intersection region
-        "passage_width_range": [0.35, 0.5], # Min/max for the width of the road passages
-        "obs_wall_range": [0.8, 1],
+        "intersection_size_range": [0.35, 0.5], # Overall size of the intersection region
+        "passage_width_range": [0.45, 0.55], # Min/max for the width of the road passages
+        "obs_wall_range": [1, 1.2],
         "building_theta_range": [0, 0] #jnp.pi/6],
     }
 
