@@ -132,6 +132,8 @@ def raytracing(starts: Pos, ends: Pos, obstacles: Obstacle, max_returns: int) ->
     alphas_return = jnp.argsort(alphas)[:max_returns]
 
     hitting_points = starts + (ends - starts) * (alphas[..., None])
+    
+    #jax.debug.print("hitting points: {}", hitting_points)
 
     return hitting_points[alphas_return]
 

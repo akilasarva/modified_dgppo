@@ -208,6 +208,8 @@ class LidarEnv(MultiAgentEnv, ABC):
         custom_obstacles: Optional[Tuple[Array, Array, Array, Array]] = None,
         transition_index: Optional[int] = None # This is now ONLY for starting a specific episode
     ) -> GraphsTuple:
+        
+        jd.print("new episode")
     
         if current_clusters is None:
             current_clusters = jnp.zeros((self.num_agents, self.n_cluster), dtype=jnp.float32)
@@ -310,6 +312,12 @@ class LidarEnv(MultiAgentEnv, ABC):
                 bridge_center = jr.uniform(center_key, (2,),
                                             minval=jnp.array([min_center_x, min_center_y]),
                                             maxval=jnp.array([max_center_x, max_center_y]))
+                
+                bridge_center = jnp.array([0.75, 0.2])
+                bridge_length = 1
+                bridge_gap_width = 0.3
+                bridge_wall_thickness = 0.06
+                bridge_theta = 0
 
                 bridge_obs_pos, bridge_obs_len_x, bridge_obs_len_y, bridge_obs_theta = \
                     create_single_bridge(
@@ -319,6 +327,7 @@ class LidarEnv(MultiAgentEnv, ABC):
                         bridge_wall_thickness,
                         bridge_theta
                     )
+                
                 all_obs_pos_list.append(bridge_obs_pos)
                 all_obs_len_x_list.append(bridge_obs_len_x)
                 all_obs_len_y_list.append(bridge_obs_len_y)
@@ -401,7 +410,7 @@ class LidarEnv(MultiAgentEnv, ABC):
                                         jnp.zeros(2), # Default if NaN
                                         initial_pos_candidate)
                 
-                initial_pos = initial_pos + jr.normal(key_agent_pos, (2,)) * 0.05
+                initial_pos = initial_pos #+ jr.normal(key_agent_pos, (2,)) * 0.05
                 initial_pos = jnp.clip(initial_pos, 0, self.area_size)
 
                 goal_pos_candidate = associator.get_region_centroid(next_region_id_tracer)
@@ -418,7 +427,7 @@ class LidarEnv(MultiAgentEnv, ABC):
                                     jnp.array([self.area_size / 2, self.area_size / 2]), # Fallback to center, not origin
                                     goal_pos)
                 
-                goal_pos = goal_pos + jr.normal(key_goal_pos, (2,)) * 0.05
+                goal_pos = goal_pos #+ jr.normal(key_goal_pos, (2,)) * 0.05
     
                 rot_angle = 0 #jr.uniform(key_rot, (), minval=-jnp.pi/4, maxval=jnp.pi/4)
 
@@ -499,6 +508,22 @@ class LidarEnv(MultiAgentEnv, ABC):
         lidar_data = self.get_lidar_data(states, obstacles)
 
         return self.get_graph(env_states, lidar_data)
+    
+    # def print_get_lidar_data(self, states: State, obstacles: Obstacle) -> Float[Array, "n_agent top_k_rays 2"]:
+    #     lidar_data = None
+    #     if self.params["n_obs"] > 0:
+    #         get_lidar_vmap = jax_vmap(
+    #             ft.partial(
+    #                 get_lidar,
+    #                 obstacles=obstacles,
+    #                 num_beams=self._params["n_rays"],
+    #                 sense_range=self._params["comm_radius"],
+    #                 max_returns=32
+    #             )
+    #         )
+    #         lidar_data = get_lidar_vmap(states[:, :2])
+    #         assert lidar_data.shape == (self.num_agents, 32, 2)
+    #     return lidar_data
 
     def get_lidar_data(self, states: State, obstacles: Obstacle) -> Float[Array, "n_agent top_k_rays 2"]:
         lidar_data = None
@@ -595,8 +620,12 @@ class LidarEnv(MultiAgentEnv, ABC):
         )
         
         lidar_data_next = self.get_lidar_data(next_agent_base_states, obstacles)
+        #printer_data = self.print_get_lidar_data(next_agent_base_states, obstacles)
         info = {}
         done = jnp.array(False)
+        
+        jd.print(f"next state: {{}}", next_agent_base_states)
+        jd.print(f"lidar data: {{}}", lidar_data_next)
 
         return self.get_graph(next_env_state, lidar_data_next), reward, cost, done, info
 
