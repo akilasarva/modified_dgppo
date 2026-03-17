@@ -19,12 +19,7 @@ ALL_POSSIBLE_REGION_NAMES = [
 def _calculate_bearing_reward(agent_vel: jnp.ndarray, target_bearing: float) -> float:
     target_vector = jnp.array([jnp.cos(target_bearing), jnp.sin(target_bearing)])
 
-    norm_agent_vel = jnp.linalg.norm(agent_vel)
-    safe_norm_agent_vel = jnp.where(norm_agent_vel > 1e-6, norm_agent_vel, 1e-6)
-
-    cosine_sim = jnp.dot(agent_vel, target_vector) / safe_norm_agent_vel
-
-    return cosine_sim
+    return jnp.dot(agent_vel, target_vector)  # speed x alignment (not normalized)
 
 def _calculate_cluster_reward_per_agent(
     current_cluster_oh_episode_i: Array,
@@ -175,18 +170,18 @@ def _calculate_preference_vector_reward(
 
 class LidarTarget(LidarEnv):
 
-    COSINE_SIM_REWARD_COEFF = 0.1        # global waypoint bearing alignment
+    COSINE_SIM_REWARD_COEFF = 0.5        # global waypoint bearing alignment (speed x direction)
     NEXT_CLUSTER_BONUS = 4.0
     INCORRECT_CLUSTER_PENALTY = -2.0
     STAY_IN_CLUSTER_BONUS = 0.2
     VELOCITY_PENALTY_IN_CLUSTER = -2
-    TERRAIN_REWARD_COEFF = 0.3           # mid-range: per-ray delta terrain value
-    PREF_VECTOR_REWARD_COEFF = 0.1       # long-range: preference vector alignment
+    TERRAIN_REWARD_COEFF = 0.5           # mid-range: per-ray delta terrain value
+    PREF_VECTOR_REWARD_COEFF = 0.5       # long-range: preference vector alignment
     TERRAIN_PENALTY_COEFF = 0.2          # immediate: road/grass occupancy penalty
     WRONG_TERRAIN_SPEED_COEFF = 0.3      # immediate: speed penalty when off sidewalk
 
     PARAMS = {
-        "car_radius": 0.05,
+        "car_radius": 0.02,
         "comm_radius": 0.5,
         "n_rays": 32,
         "obs_len_range": [0.1, 0.3],
@@ -279,10 +274,11 @@ class LidarTarget(LidarEnv):
         reward -= (jnp.linalg.norm(action, axis=1) ** 2).mean() * 0.001
 
         # ── Immediate terrain penalties (one-hot "haptic" feedback) ──────────
-        # Road is strongly penalised; Grass is mildly penalised; Sidewalk = 0.
-        road_penalty  = jnp.where(current_terrain_id == 0, -1.0, 0.0)
-        grass_penalty = jnp.where(current_terrain_id == 1, -0.3, 0.0)
-        immediate_terrain_penalty = (road_penalty + grass_penalty).mean()
+        # Road is strongly penalised; Grass is mildly penalised; Sidewalk is rewarded.
+        road_penalty    = jnp.where(current_terrain_id == 0, -1.0, 0.0)
+        grass_penalty   = jnp.where(current_terrain_id == 1, -0.3, 0.0)
+        sidewalk_bonus  = jnp.where(current_terrain_id == 2,  0.5, 0.0)
+        immediate_terrain_penalty = (road_penalty + grass_penalty + sidewalk_bonus).mean()
         reward += jnp.where(is_bridge_env, immediate_terrain_penalty * self.TERRAIN_PENALTY_COEFF, 0.0)
 
         # ── Speed penalty when on non-target terrain ─────────────────────────
