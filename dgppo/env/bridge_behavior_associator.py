@@ -142,3 +142,95 @@ class BehaviorBridge(BehaviorAssociator):
     def get_region_centroid(self, region_id: jnp.ndarray):
         centroid = self.all_region_centroids_jax_array[region_id]
         return centroid
+
+
+def visualize_terrain(
+    ax,
+    bridge_center: np.ndarray,   # (2,) numpy
+    bridge_gap_width: float,
+    bridge_wall_thickness: float,
+    bridge_theta: float,          # radians
+    side_length: float,
+    terrain_config: int = 2,      # 1 or 2 — must match TERRAIN_CONFIG in base.py
+    resolution: int = 300,
+) -> list:
+    """
+    Draw terrain zones as a background raster image behind the scene.
+
+    Terrain IDs  (match TERRAIN_NAMES in base.py)
+    -----------------------------------------------
+    0 = Road      (gray)    — centre of the bridge gap  [config 2 only]
+    1 = Grass     (green)   — open field away from bridge
+    2 = Sidewalk  (tan)     — near the bridge walls
+
+    Config 1: full bridge-width diagonal band → Sidewalk, everything else → Grass
+    Config 2: centre of gap → Road, thin border by walls → Sidewalk, outside → Grass
+
+    Returns a list of matplotlib Patch objects for use in a legend.
+    """
+    from matplotlib.patches import Patch
+
+    xs = np.linspace(0, side_length, resolution)
+    ys = np.linspace(0, side_length, resolution)
+    XX, YY = np.meshgrid(xs, ys)
+
+    dx = XX - bridge_center[0]
+    dy = YY - bridge_center[1]
+    cos_t = np.cos(bridge_theta)
+    sin_t = np.sin(bridge_theta)
+    # Perpendicular distance from bridge centre-line
+    perp = np.abs(-sin_t * dx + cos_t * dy)
+
+    half_gap  = bridge_gap_width / 2.0
+    full_half = half_gap + bridge_wall_thickness  # outer edge of walls
+
+    if terrain_config == 1:
+        # Entire band = Sidewalk(2), rest = Grass(1)
+        terrain_grid = np.where(perp <= full_half, 2, 1)
+    else:
+        # Config 2: Road(0) | Sidewalk(2) | Grass(1)
+        # Each sidewalk = 1/5 of gap width (same width on both sides, ~1/5 to 1/4 of gap)
+        sidewalk_border = bridge_gap_width * 0.2
+        road_half = half_gap - sidewalk_border
+        terrain_grid = np.where(perp <= road_half, 0,
+                       np.where(perp <= half_gap, 2, 1))
+
+    # RGBA colour per terrain ID
+    # Road=gray, Grass=muted green, Sidewalk=sandy tan
+    color_map = {
+        0: np.array([0.55, 0.55, 0.55, 0.45]),
+        1: np.array([0.45, 0.72, 0.35, 0.35]),
+        2: np.array([0.88, 0.78, 0.50, 0.50]),
+    }
+    rgba = np.zeros((*terrain_grid.shape, 4), dtype=np.float32)
+    for tid, col in color_map.items():
+        rgba[terrain_grid == tid] = col
+
+    ax.imshow(
+        rgba,
+        extent=[0, side_length, 0, side_length],
+        origin='lower',
+        zorder=0,
+        aspect='auto',
+        interpolation='nearest',
+    )
+
+    # Build legend patches (Road only shown for config 2)
+    terrain_patches = [
+        Patch(facecolor=color_map[1][:3], alpha=float(color_map[1][3]), label='Terrain: Grass'),
+        Patch(facecolor=color_map[2][:3], alpha=float(color_map[2][3]), label='Terrain: Sidewalk'),
+    ]
+    if terrain_config == 2:
+        terrain_patches.insert(
+            0, Patch(facecolor=color_map[0][:3], alpha=float(color_map[0][3]), label='Terrain: Road')
+        )
+
+    print(f"[TERRAIN VIZ DEBUG] config={terrain_config}  "
+          f"half_gap={half_gap:.3f}  full_half={full_half:.3f}  "
+          f"bridge_theta_deg={np.degrees(bridge_theta):.1f}")
+    unique, counts = np.unique(terrain_grid, return_counts=True)
+    names = {0: 'Road', 1: 'Grass', 2: 'Sidewalk'}
+    for u, c in zip(unique, counts):
+        print(f"  {names.get(int(u), '?'):10s} id={u}  pixels={c}")
+
+    return terrain_patches

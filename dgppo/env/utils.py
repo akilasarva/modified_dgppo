@@ -112,6 +112,23 @@ def inside_obstacles(points: Pos, obstacles: Obstacle = None, r: Radius = 0.) ->
     return is_in
 
 
+def get_ray_alphas(starts: Pos, ends: Pos, obstacles: Obstacle) -> jnp.ndarray:
+    """Nearest obstacle hit alpha for each ray (0..∞). Shape: (num_rays,)."""
+    is_in = inside_obstacles(starts, obstacles)
+
+    def raytracing_single(start, end, obstacle):
+        return obstacle.raytracing(start, end)
+
+    def raytracing_any(start, end, obstacle):
+        return jax.vmap(ft.partial(raytracing_single, start, end))(obstacle).min()
+
+    if obstacles.center.shape[0] == 0:
+        return jnp.ones(starts.shape[0]) * 2.0
+    alphas = jax.vmap(ft.partial(raytracing_any, obstacle=obstacles))(starts, ends)
+    alphas = alphas * (1.0 - is_in.astype(jnp.float32))
+    return alphas
+
+
 def raytracing(starts: Pos, ends: Pos, obstacles: Obstacle, max_returns: int) -> Pos:
     # if the start point if inside the obstacle, return the start point
     is_in = inside_obstacles(starts, obstacles)
@@ -132,6 +149,8 @@ def raytracing(starts: Pos, ends: Pos, obstacles: Obstacle, max_returns: int) ->
     alphas_return = jnp.argsort(alphas)[:max_returns]
 
     hitting_points = starts + (ends - starts) * (alphas[..., None])
+    
+    #jax.debug.print("hitting points: {}", hitting_points)
 
     return hitting_points[alphas_return]
 

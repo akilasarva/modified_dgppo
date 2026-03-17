@@ -21,7 +21,7 @@ from ..trainer.utils import centered_norm
 from ..utils.typing import EdgeIndex, Pos2d, Pos3d, Array
 from ..utils.utils import merge01, tree_index, MutablePatchCollection, save_anim
 from dgppo.env.obstacle import Cuboid, Sphere, Obstacle, Rectangle
-from dgppo.env.bridge_behavior_associator import BehaviorBridge
+from dgppo.env.bridge_behavior_associator import BehaviorBridge, visualize_terrain
 
 ALL_POSSIBLE_REGION_NAMES = [
         "open_space",
@@ -317,9 +317,30 @@ def render_lidar(
         all_region_names=ALL_POSSIBLE_REGION_NAMES
     )
     
-    # Visualize the behavior regions
-    if dim == 2: # Only visualize in 2D
-        behavior_associator.visualize_behavior_regions(ax)
+    # Visualize terrain background + cluster regions (2D only)
+    if dim == 2:
+        terrain_legend_patches = []
+        if bridge_length_sim > 0:
+            terrain_config_sim = int(np.array(first_env_state.terrain_config).flat[0]) if hasattr(first_env_state, 'terrain_config') else 1
+            terrain_legend_patches = visualize_terrain(
+                ax=ax,
+                bridge_center=bridge_center_sim,
+                bridge_gap_width=bridge_gap_width_sim,
+                bridge_wall_thickness=bridge_wall_thickness_sim,
+                bridge_theta=bridge_theta_sim,
+                side_length=side_length,
+                terrain_config=terrain_config_sim,
+            )
+        behavior_associator.visualize_behavior_regions(ax)  # draws cluster region patches + its own legend
+        # Append terrain entries to the existing legend
+        if terrain_legend_patches:
+            existing_handles, existing_labels = ax.get_legend_handles_labels()
+            ax.legend(
+                handles=terrain_legend_patches + existing_handles,
+                labels=[p.get_label() for p in terrain_legend_patches] + existing_labels,
+                loc='upper right',
+                fontsize='small',
+            )
 
     # plot the first frame
     T_graph = rollout.graph
@@ -388,6 +409,22 @@ def render_lidar(
         agent_col = ax.scatter(n_pos[:, 0], n_pos[:, 1], n_pos[:, 2],
                                s=plot_r, c=n_color, zorder=5)  # todo: the size of the agent might not be correct
 
+    # Semantic lidar terrain colours (Road=0, Grass=1, Sidewalk=2)
+    _lidar_terrain_colors = ['#808080', '#2a9e2a', '#c8a050']
+
+    def _get_edge_colors(senders, receivers, is_goal_mask, terrain_ids):
+        colors = []
+        for ii in range(len(senders)):
+            if is_goal_mask[ii]:
+                colors.append(edge_goal_color)
+            elif int(receivers[ii]) >= n_agent + n_goal:
+                hit_idx = int(receivers[ii]) - (n_agent + n_goal)
+                tid = int(terrain_ids[hit_idx]) if hit_idx < len(terrain_ids) else 1
+                colors.append(_lidar_terrain_colors[tid % 3])
+            else:
+                colors.append("0.2")
+        return colors
+
     # plot edges
     all_pos = graph0.states[:n_agent + n_goal + n_hits, :dim]
     if dim == 1:
@@ -399,16 +436,29 @@ def render_lidar(
     e_lines = np.stack([e_start, e_end], axis=1)  # (e, n_pts, dim)
     e_is_goal = (n_agent <= graph0.senders) & (graph0.senders < n_agent + n_goal)
     e_is_goal = e_is_goal[~is_pad]
-    e_colors = [edge_goal_color if e_is_goal[ii] else "0.2" for ii in range(len(e_start))]
+    _init_terrain_ids = np.array(graph0.env_states.lidar_hit_terrain_ids) if \
+        hasattr(graph0.env_states, 'lidar_hit_terrain_ids') else np.ones(n_hits, dtype=int)
+    e_colors = _get_edge_colors(e_edge_index[0], e_edge_index[1], e_is_goal, _init_terrain_ids)
     if dim == 1:
         e_lines = e_lines[~e_is_goal]
         e_colors = "0.2"
         edge_col = LineCollection(e_lines, colors=e_colors, linewidths=2, alpha=0.5, zorder=3)
     elif dim == 2:
-        edge_col = LineCollection(e_lines, colors=e_colors, linewidths=2, alpha=0.5, zorder=3)
+        edge_col = LineCollection(e_lines, colors=e_colors, linewidths=1.2, alpha=0.6, zorder=3)
     else:
         edge_col = Line3DCollection(e_lines, colors=e_colors, linewidths=2, alpha=0.5, zorder=3)
     ax.add_collection(edge_col)
+
+    # Lidar hit-point scatter (coloured by terrain)
+    if dim == 2 and n_hits > 0:
+        _hit_pos0 = np.array(graph0.states[n_agent+n_goal:n_agent+n_goal+n_hits, :2])
+        _hit_colors0 = [_lidar_terrain_colors[int(t) % 3] for t in _init_terrain_ids[:n_hits]]
+        lidar_hit_scatter = ax.scatter(
+            _hit_pos0[:, 0], _hit_pos0[:, 1],
+            c=_hit_colors0, s=18, zorder=5, alpha=0.9, linewidths=0,
+        )
+    else:
+        lidar_hit_scatter = None
 
     # text for cost and reward
     text_font_opts = dict(
@@ -488,12 +538,30 @@ def render_lidar(
         else:
             Vh_text = ax.text2D(0.99, 0.99, "Vh: []", va="top", ha="right", **text_font_opts)
 
+    # text for per-agent terrain names
+    _terrain_names = ["Road", "Grass", "Sidewalk"]
+    def _terrain_str(env_state):
+        oh = np.array(env_state.current_terrain_oh[:n_agent])  # (n_agent, 3)
+        ids = np.argmax(oh, axis=-1)
+        return "Terrain: " + "  ".join(f"{_terrain_names[int(t)]}" for i, t in enumerate(ids))
+
+    terrain_text_opts = dict(size=13, color="k", family="cursive", weight="normal", transform=ax.transAxes)
+    if dim == 2:
+        terrain_text = ax.text(0.02, 0.02, _terrain_str(graph0.env_states), va="bottom", **terrain_text_opts)
+    else:
+        terrain_text = None
+
     # init function for animation
     def init_fn() -> list[plt.Artist]:
         # This list should contain all artists that will be updated in the animation.
         # When visualizing static regions, they are added to `ax` directly and don't
         # need to be part of the `init_fn` return if they are not dynamically updated.
-        return [agent_col, edge_col, *agent_labels, cost_text, *safe_text, *cnt_col, kk_text]
+        artists = [agent_col, edge_col, *agent_labels, cost_text, *safe_text, *cnt_col, kk_text]
+        if terrain_text is not None:
+            artists.append(terrain_text)
+        if lidar_hit_scatter is not None:
+            artists.append(lidar_hit_scatter)
+        return artists
 
     # update function for animation
     def update(kk: int) -> list[plt.Artist]:
@@ -510,20 +578,29 @@ def render_lidar(
             agent_col.set_offsets(n_pos_t[:n_agent + n_goal, :2])
             agent_col.set_3d_properties(n_pos_t[:n_agent + n_goal, 2], zdir='z')
 
-        # update edges
+        # update edges (lidar rays coloured by terrain)
         e_edge_index_t = np.stack([graph.senders, graph.receivers], axis=0)
         is_pad_t = np.any(e_edge_index_t == n_agent + n_goal + n_hits, axis=0)
         e_edge_index_t = e_edge_index_t[:, ~is_pad_t]
         e_start_t, e_end_t = n_pos_t[e_edge_index_t[0, :]], n_pos_t[e_edge_index_t[1, :]]
         e_is_goal_t = (n_agent <= graph.senders) & (graph.senders < n_agent + n_goal)
         e_is_goal_t = e_is_goal_t[~is_pad_t]
-        e_colors_t = [edge_goal_color if e_is_goal_t[ii] else "0.2" for ii in range(len(e_start_t))]
+        _terrain_ids_t = np.array(graph.env_states.lidar_hit_terrain_ids) if \
+            hasattr(graph.env_states, 'lidar_hit_terrain_ids') else np.ones(n_hits, dtype=int)
+        e_colors_t = _get_edge_colors(e_edge_index_t[0], e_edge_index_t[1], e_is_goal_t, _terrain_ids_t)
         e_lines_t = np.stack([e_start_t, e_end_t], axis=1)
         if dim == 1:
             e_lines_t = e_lines_t[~e_is_goal_t]
             e_colors_t = "0.2"
         edge_col.set_segments(e_lines_t)
         edge_col.set_colors(e_colors_t)
+
+        # update lidar hit-point scatter
+        if lidar_hit_scatter is not None and n_hits > 0:
+            _hit_pos_t = n_pos_t[n_agent+n_goal:n_agent+n_goal+n_hits, :2]
+            _hit_colors_t = [_lidar_terrain_colors[int(t) % 3] for t in _terrain_ids_t[:n_hits]]
+            lidar_hit_scatter.set_offsets(_hit_pos_t)
+            lidar_hit_scatter.set_color(_hit_colors_t)
 
         # update agent labels
         for ii in range(n_agent):
@@ -571,7 +648,15 @@ def render_lidar(
 
         kk_text.set_text("kk={:04}".format(kk))
 
-        return [agent_col, edge_col, *agent_labels, cost_text, *safe_text, *cnt_col_t, kk_text]
+        if terrain_text is not None:
+            terrain_text.set_text(_terrain_str(graph.env_states))
+
+        artists = [agent_col, edge_col, *agent_labels, cost_text, *safe_text, *cnt_col_t, kk_text]
+        if terrain_text is not None:
+            artists.append(terrain_text)
+        if lidar_hit_scatter is not None:
+            artists.append(lidar_hit_scatter)
+        return artists
 
     fps = 30.0
     spf = 1 / fps
@@ -579,7 +664,7 @@ def render_lidar(
     anim_T = len(T_graph.n_node)
     ani = FuncAnimation(fig, update, frames=anim_T, init_func=init_fn, interval=mspf, blit=True)
     save_anim(ani, video_path)
-    
+
 def render_mpe(
         rollout: Rollout,
         video_path: pathlib.Path,

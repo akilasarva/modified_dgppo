@@ -19,25 +19,32 @@ from ...utils.utils import merge01, jax_vmap
 from ..base import MultiAgentEnv
 from dgppo.env.obstacle import Obstacle, Rectangle
 from dgppo.env.plot import render_lidar # Ensure BehaviorAssociator is imported from plot
-from dgppo.env.utils import get_lidar, get_node_goal_rng
+from dgppo.env.utils import get_lidar, get_node_goal_rng, get_ray_alphas
 from dgppo.env.bridge_behavior_associator import BehaviorBridge
 
 class LidarEnvState(NamedTuple):
     agent: State
     goal: State
     obstacle: Obstacle
-    
+
     bearing: Float[Array, "n_agent"]
     current_cluster_oh: Float[Array, "n_agent n_cluster"]
     start_cluster_oh: Float[Array, "n_agent n_cluster"]
     next_cluster_oh: Float[Array, "n_agent n_cluster"]
     next_cluster_bonus_awarded: jnp.ndarray
 
+    # Terrain one-hot: [Road, Grass, Sidewalk]
+    current_terrain_oh: Float[Array, "n_agent 3"]
+    # Semantic lidar — full 2*n_rays hits per agent, stored flat
+    lidar_hit_terrain_ids: jnp.ndarray   # (n_agents * 2*n_rays,)  terrain ID per hit
+    lidar_hit_positions:   jnp.ndarray   # (n_agents * 2*n_rays, 2) world position per hit
+
     bridge_center: Float[Array, "2"]
     bridge_length: float
     bridge_gap_width: float
     bridge_wall_thickness: float
     bridge_theta: float # Stored in radians
+    terrain_config: jnp.ndarray  # scalar int: 1 or 2, sampled randomly per episode
 
     @property
     def n_agent(self) -> int:
@@ -49,6 +56,180 @@ class LidarEnvState(NamedTuple):
 
 
 LidarEnvGraphsTuple = GraphsTuple[State, LidarEnvState]
+
+# Terrain IDs: Road=0, Grass=1, Sidewalk=2
+# terrain_config controls detection geometry (see get_terrain_id).
+TERRAIN_NAMES = ["Road", "Grass", "Sidewalk"]
+TERRAIN_CONFIG = 1  # Switch between 1 and 2 here
+
+# Target terrain: the zone the robot should be in.
+# Semantic lidar reports distance to the nearest boundary OF this zone per ray:
+#   - if in target  → distance to exit edge (avoid crossing it)
+#   - if not in target → distance to entry edge (approach it)
+TARGET_TERRAIN_ID = 2  # Sidewalk
+
+
+def get_terrain_id(
+    agent_pos: jnp.ndarray,             # (2,)
+    bridge_center: jnp.ndarray,          # (2,)
+    bridge_gap_width: jnp.ndarray,       # scalar
+    bridge_wall_thickness: jnp.ndarray,  # scalar
+    bridge_theta: jnp.ndarray,           # scalar, radians
+    terrain_config: jnp.ndarray,         # scalar int: 1 or 2
+) -> jnp.ndarray:
+    """
+    Geometry-based terrain detection using bridge-local perpendicular distance.
+    The strip extends the full frame (no cutoff along the bridge axis).
+
+    terrain_config = 1
+      Sidewalk : |perp| <= half_gap + wall_thickness  (entire bridge-width band)
+      Grass    : everything else
+
+    terrain_config = 2
+      Road     : |perp| <= half_gap - sidewalk_border  (centre of the open gap)
+      Sidewalk : half_gap - sidewalk_border < |perp| <= half_gap  (1/5 of gap per side)
+      Grass    : |perp| > half_gap  (outside the gap entirely)
+    """
+    dx = agent_pos[0] - bridge_center[0]
+    dy = agent_pos[1] - bridge_center[1]
+
+    cos_t = jnp.cos(bridge_theta)
+    sin_t = jnp.sin(bridge_theta)
+
+    # Perpendicular distance into bridge-local frame
+    perp = jnp.abs(-sin_t * dx + cos_t * dy)
+
+    half_gap  = bridge_gap_width / 2.0
+    full_half = half_gap + bridge_wall_thickness  # outer edge of walls
+
+    # Config 1: entire diagonal band = Sidewalk(2), rest = Grass(1)
+    terrain_id_config1 = jnp.where(perp <= full_half, 2, 1)
+
+    # Config 2: Road(0) | Sidewalk(2) | Grass(1)
+    sidewalk_border = bridge_gap_width * 0.2  # 1/5 of gap width per side
+    road_half = half_gap - sidewalk_border
+    is_road     = perp <= road_half
+    is_sidewalk = (perp > road_half) & (perp <= half_gap)
+    terrain_id_config2 = jnp.where(is_road, 0, jnp.where(is_sidewalk, 2, 1))
+
+    return jnp.where(terrain_config == 1, terrain_id_config1, terrain_id_config2)
+
+
+def _get_semantic_lidar_single(
+    agent_pos: jnp.ndarray,              # (2,)
+    obstacles,                           # Obstacle (stacked)
+    bridge_center: jnp.ndarray,          # (2,)
+    bridge_gap_width: jnp.ndarray,
+    bridge_wall_thickness: jnp.ndarray,
+    bridge_theta: jnp.ndarray,
+    terrain_config: jnp.ndarray,
+    num_beams: int,
+    sense_range: float,
+) -> Tuple[jnp.ndarray, jnp.ndarray]:
+    """
+    Per-ray semantic lidar for one agent.
+
+    For each of the B rays, returns TWO hit points (2B total):
+      [0 : B]  — obstacle hit (or sensor-range endpoint if no obstacle)
+      [B : 2B] — nearest boundary of TARGET_TERRAIN_ID zone along that ray
+                 (or sensor-range endpoint if no boundary within range)
+
+    This means:
+      - if agent is IN target terrain  → boundary hit = exit edge  (stay away)
+      - if agent is NOT in target terrain → boundary hit = entry edge (approach it)
+
+    Returns:
+        hit_points:  (2*num_beams, 2)   positions in world frame
+        terrain_ids: (2*num_beams,)     terrain at each hit point (0=Road,1=Grass,2=Sidewalk)
+    """
+    thetas = jnp.linspace(-jnp.pi, jnp.pi - 2 * jnp.pi / num_beams, num_beams)
+    dirs   = jnp.stack([jnp.cos(thetas), jnp.sin(thetas)], axis=-1)  # (B, 2)
+    starts = jnp.tile(agent_pos[None, :], (num_beams, 1))             # (B, 2)
+    ends   = starts + dirs * sense_range                               # (B, 2)
+
+    # ── Obstacle hit alphas (one per ray) ──────────────────────────────────
+    alphas_obs = get_ray_alphas(starts, ends, obstacles)               # (B,)
+
+    # ── Nearest TARGET-terrain boundary alpha (one per ray) ────────────────
+    cos_bt = jnp.cos(bridge_theta)
+    sin_bt = jnp.sin(bridge_theta)
+    dx0    = agent_pos[0] - bridge_center[0]
+    dy0    = agent_pos[1] - bridge_center[1]
+    perp_start = -sin_bt * dx0 + cos_bt * dy0                         # scalar
+    perp_dirs  = -sin_bt * dirs[:, 0] + cos_bt * dirs[:, 1]           # (B,)
+
+    half_gap        = bridge_gap_width / 2.0
+    full_half       = half_gap + bridge_wall_thickness
+    sidewalk_border = bridge_gap_width * 0.2
+    road_half       = half_gap - sidewalk_border
+
+    # Borders of TARGET_TERRAIN_ID zone (Sidewalk = ±road_half, ±half_gap for config2;
+    # ±full_half for config1).  Both configs share the same slot count (4).
+    # Config 1: Sidewalk occupies |perp| ≤ full_half  →  borders at ±full_half
+    # Config 2: Sidewalk occupies road_half < |perp| ≤ half_gap  →  borders at ±road_half, ±half_gap
+    target_borders_c1 = jnp.array([ full_half, -full_half,  full_half, -full_half])
+    target_borders_c2 = jnp.array([ road_half, -road_half,  half_gap,  -half_gap])
+    target_borders = jnp.where(terrain_config == 1, target_borders_c1, target_borders_c2)  # (4,)
+
+    eps      = 1e-8
+    safe_pd  = jnp.where(jnp.abs(perp_dirs) > eps, perp_dirs, eps)
+    alphas_b = (target_borders[None, :] - perp_start) / (safe_pd[:, None] * sense_range)  # (B, 4)
+    valid    = (alphas_b > 1e-4) & (alphas_b < 1.0) & (jnp.abs(perp_dirs[:, None]) > eps)
+    alphas_b = jnp.where(valid, alphas_b, 2.0)
+    alphas_terrain = alphas_b.min(axis=-1)                             # (B,) nearest target border
+
+    # ── Build hit points ────────────────────────────────────────────────────
+    # First B: obstacle hits; last B: terrain boundary hits (same ray order)
+    obs_hits      = agent_pos[None, :] + alphas_obs[:, None]     * sense_range * dirs  # (B, 2)
+    boundary_hits = agent_pos[None, :] + alphas_terrain[:, None] * sense_range * dirs  # (B, 2)
+    hit_points    = jnp.concatenate([obs_hits, boundary_hits])                          # (2B, 2)
+
+    _get_tid = ft.partial(
+        get_terrain_id,
+        bridge_center=bridge_center,
+        bridge_gap_width=bridge_gap_width,
+        bridge_wall_thickness=bridge_wall_thickness,
+        bridge_theta=bridge_theta,
+        terrain_config=terrain_config,
+    )
+
+    # ── Terrain IDs ─────────────────────────────────────────────────────────
+    # Obstacle hits: terrain AT the hit position (what ground the obstacle sits on)
+    obs_terrain_ids = jax_vmap(_get_tid)(obs_hits)                     # (B,)
+
+    # Boundary hits: terrain on the OTHER SIDE of the boundary (what you'd enter)
+    # Step a small epsilon past the hit in the ray direction before sampling terrain
+    BOUNDARY_STEP = 0.005  # metres past the boundary line (must be << sidewalk width ~0.04–0.08 m)
+    boundary_beyond = boundary_hits + BOUNDARY_STEP * dirs             # (B, 2)
+    boundary_terrain_ids = jax_vmap(_get_tid)(boundary_beyond)         # (B,)
+
+    terrain_ids = jnp.concatenate([obs_terrain_ids, boundary_terrain_ids])  # (2B,)
+
+    return hit_points, terrain_ids
+
+
+def _topk_hits_per_agent(
+    hits_2ray: jnp.ndarray,   # (2*n_rays, 2) — obstacle hits [0:n_rays] + boundary hits [n_rays:]
+    tids_2ray: jnp.ndarray,   # (2*n_rays,)
+    agent_pos: jnp.ndarray,   # (2,)
+    n_rays: int,
+    top_k: int,
+) -> Tuple[jnp.ndarray, jnp.ndarray]:
+    """Select top-k closest obstacle hits and top-k closest boundary hits for one agent."""
+    obs_hits = hits_2ray[:n_rays];  bnd_hits = hits_2ray[n_rays:]
+    obs_tids = tids_2ray[:n_rays];  bnd_tids = tids_2ray[n_rays:]
+
+    obs_dists = jnp.linalg.norm(obs_hits - agent_pos[None, :], axis=-1)
+    bnd_dists = jnp.linalg.norm(bnd_hits - agent_pos[None, :], axis=-1)
+
+    _, obs_idx = jax.lax.top_k(-obs_dists, top_k)
+    _, bnd_idx = jax.lax.top_k(-bnd_dists, top_k)
+
+    return (
+        jnp.concatenate([obs_hits[obs_idx], bnd_hits[bnd_idx]]),  # (2*top_k, 2)
+        jnp.concatenate([obs_tids[obs_idx], bnd_tids[bnd_idx]]),  # (2*top_k,)
+    )
+
 
 def create_single_bridge(
     bridge_center: jnp.ndarray, # (2,) for x, y
@@ -180,8 +361,13 @@ class LidarEnv(MultiAgentEnv, ABC):
         return self.n_cluster # One-hot encoding dimension
 
     @property
+    def terrain_oh_dim(self) -> int:
+        return 3  # Road=0, Grass=1, Sidewalk=2
+
+    @property
     def node_dim(self) -> int:
-        return self.state_dim + self.bearing_dim + 3 * self.cluster_oh_dim + 3
+        # +4 indicators: is_obs | is_terrain_boundary | is_goal | is_agent
+        return self.state_dim + self.bearing_dim + 3 * self.cluster_oh_dim + self.terrain_oh_dim + 4
     
     @property
     def edge_dim(self) -> int:
@@ -208,6 +394,8 @@ class LidarEnv(MultiAgentEnv, ABC):
         custom_obstacles: Optional[Tuple[Array, Array, Array, Array]] = None,
         transition_index: Optional[int] = None # This is now ONLY for starting a specific episode
     ) -> GraphsTuple:
+        
+        # jd.print("new episode")
     
         if current_clusters is None:
             current_clusters = jnp.zeros((self.num_agents, self.n_cluster), dtype=jnp.float32)
@@ -226,6 +414,7 @@ class LidarEnv(MultiAgentEnv, ABC):
         bridge_gap_width_env_state: Float[Array, ""] = jnp.array(0.0)
         bridge_wall_thickness_env_state: Float[Array, ""] = jnp.array(0.0)
         bridge_theta_env_state: Float[Array, ""] = jnp.array(0.0)
+        terrain_config_env_state: jnp.ndarray = jnp.array(1, dtype=jnp.int32)
         initial_bonus_awarded = jnp.zeros(self.num_agents, dtype=jnp.bool_)
 
         num_bridges = 1 
@@ -275,7 +464,7 @@ class LidarEnv(MultiAgentEnv, ABC):
                     print("Warning: Only 1 bridge is currently supported for direct parameter storage.")
 
                 bridge_rand_key, key = jr.split(key)
-                center_key, length_key, gap_key, thickness_key, theta_key = jr.split(bridge_rand_key, 5)
+                center_key, length_key, gap_key, thickness_key, theta_key, config_key = jr.split(bridge_rand_key, 6)
 
                 bridge_length = jr.uniform(length_key, (),
                                             minval=self._params.get("bridge_length_range", (0.5, 1.0))[0],
@@ -287,7 +476,8 @@ class LidarEnv(MultiAgentEnv, ABC):
                                                     minval=self._params.get("bridge_wall_thickness_range", (0.03, 0.1))[0],
                                                     maxval=self._params.get("bridge_wall_thickness_range", (0.03, 0.1))[1])
                 bridge_theta = jr.uniform(theta_key, (), minval=0, maxval=2 * jnp.pi)
-            
+                terrain_config_episode = jr.randint(config_key, (), minval=1, maxval=3)  # 1 or 2
+
                 effective_len = bridge_length
                 effective_width = bridge_gap_width + 2 * bridge_wall_thickness
                 
@@ -310,6 +500,12 @@ class LidarEnv(MultiAgentEnv, ABC):
                 bridge_center = jr.uniform(center_key, (2,),
                                             minval=jnp.array([min_center_x, min_center_y]),
                                             maxval=jnp.array([max_center_x, max_center_y]))
+                
+                # bridge_center = jnp.array([0.75, 0.2])
+                # bridge_length = 1
+                # bridge_gap_width = 0.3
+                # bridge_wall_thickness = 0.06
+                # bridge_theta = 0
 
                 bridge_obs_pos, bridge_obs_len_x, bridge_obs_len_y, bridge_obs_theta = \
                     create_single_bridge(
@@ -319,6 +515,7 @@ class LidarEnv(MultiAgentEnv, ABC):
                         bridge_wall_thickness,
                         bridge_theta
                     )
+                
                 all_obs_pos_list.append(bridge_obs_pos)
                 all_obs_len_x_list.append(bridge_obs_len_x)
                 all_obs_len_y_list.append(bridge_obs_len_y)
@@ -329,6 +526,7 @@ class LidarEnv(MultiAgentEnv, ABC):
                 bridge_gap_width_env_state = bridge_gap_width
                 bridge_wall_thickness_env_state = bridge_wall_thickness
                 bridge_theta_env_state = bridge_theta
+                terrain_config_env_state = terrain_config_episode
 
         if all_obs_pos_list:
             combined_obs_pos = jnp.concatenate(all_obs_pos_list, axis=0)
@@ -420,7 +618,7 @@ class LidarEnv(MultiAgentEnv, ABC):
                 
                 goal_pos = goal_pos + jr.normal(key_goal_pos, (2,)) * 0.05
     
-                rot_angle = 0 #jr.uniform(key_rot, (), minval=-jnp.pi/4, maxval=jnp.pi/4)
+                rot_angle = jr.uniform(key_rot, (), minval=-jnp.pi/4, maxval=jnp.pi/4)
 
                 cos_rot = jnp.cos(rot_angle)
                 sin_rot = jnp.sin(rot_angle)
@@ -460,45 +658,92 @@ class LidarEnv(MultiAgentEnv, ABC):
             start_clusters = jnp.stack(start_clusters_oh_list)
             next_clusters = jnp.stack(next_clusters_oh_list)
 
+            # --- Terrain one-hot at reset (geometry-based, independent of clusters) ---
+            initial_terrain_ids = jax_vmap(
+                ft.partial(
+                    get_terrain_id,
+                    bridge_center=bridge_center_env_state,
+                    bridge_gap_width=bridge_gap_width_env_state,
+                    bridge_wall_thickness=bridge_wall_thickness_env_state,
+                    bridge_theta=bridge_theta_env_state,
+                    terrain_config=terrain_config_env_state,
+                )
+            )(states[:, :2])  # (n_agents,)
+            initial_terrain_oh = jax.nn.one_hot(initial_terrain_ids, self.terrain_oh_dim)  # (n_agents, 3)
+            # jd.print("[TERRAIN RESET DEBUG] terrain_ids (0=Road,1=Grass,2=Sidewalk): {}", initial_terrain_ids)
+            # jd.print("[TERRAIN RESET DEBUG] terrain_oh: {}", initial_terrain_oh)
+
         else: # Fallback if no bridges are generated or BehaviorAssociator not used
             states, goals = get_node_goal_rng(
                 key, self.area_size, 2, self.num_agents, 2.2 * self._params["car_radius"], obstacles)
-            
+
             states = jnp.concatenate(
                 [states, jnp.zeros((self.num_agents, self.state_dim - states.shape[1]), dtype=states.dtype)], axis=1)
             goals = jnp.concatenate(
                 [goals, jnp.zeros((self.num_goals, self.state_dim - goals.shape[1]), dtype=goals.dtype)], axis=1)
 
-            bearing = jnp.zeros((self.num_agents,), dtype=jnp.float32) 
+            bearing = jnp.zeros((self.num_agents,), dtype=jnp.float32)
             current_clusters = jnp.zeros((self.num_agents, self.n_cluster), dtype=jnp.float32)
             next_clusters = jnp.zeros((self.num_agents, self.n_cluster), dtype=jnp.float32)
-            associator = BehaviorAssociator(bridges=[], buildings=[], obstacles=[],
-                                            region_name_to_id=self.CLUSTER_MAP,
-                                            region_id_to_name=self._id_to_curriculum_prefix_map)
+            # Default: all Grass when no bridge present
+            initial_terrain_oh = jnp.zeros((self.num_agents, self.terrain_oh_dim), dtype=jnp.float32)
+            initial_terrain_oh = initial_terrain_oh.at[:, 1].set(1.0)  # Grass
 
 
         assert states.shape == (self.num_agents, self.state_dim)
         assert goals.shape == (self.num_goals, self.state_dim)
-        
+
+        lidar_data, lidar_terrain_ids = self.get_semantic_lidar_data(
+            states, obstacles,
+            bridge_center_env_state, bridge_gap_width_env_state,
+            bridge_wall_thickness_env_state, bridge_theta_env_state,
+            terrain_config_env_state,
+        )
+        n_full = self.num_agents * 2 * self._params["n_rays"]
+        if lidar_data is not None:
+            lidar_hit_terrain_ids_flat = merge01(lidar_terrain_ids)        # (n_full,)
+            lidar_hit_positions_flat   = merge01(lidar_data)               # (n_full, 2)
+        else:
+            lidar_hit_terrain_ids_flat = jnp.ones(n_full, dtype=jnp.int32)
+            lidar_hit_positions_flat   = jnp.zeros((n_full, 2), dtype=jnp.float32)
+
         env_states = LidarEnvState(
-            agent=states, 
-            goal=goals, 
+            agent=states,
+            goal=goals,
             obstacle=obstacles,
-            bearing=bearing, 
+            bearing=bearing,
             current_cluster_oh=current_clusters,
             start_cluster_oh=start_clusters,
             next_cluster_oh=next_clusters,
             next_cluster_bonus_awarded=initial_bonus_awarded,
+            current_terrain_oh=initial_terrain_oh,
+            lidar_hit_terrain_ids=lidar_hit_terrain_ids_flat,
+            lidar_hit_positions=lidar_hit_positions_flat,
             bridge_center=bridge_center_env_state,
             bridge_length=bridge_length_env_state,
             bridge_gap_width=bridge_gap_width_env_state,
             bridge_wall_thickness=bridge_wall_thickness_env_state,
             bridge_theta=bridge_theta_env_state,
+            terrain_config=terrain_config_env_state,
         )
 
-        lidar_data = self.get_lidar_data(states, obstacles)
-
         return self.get_graph(env_states, lidar_data)
+    
+    # def print_get_lidar_data(self, states: State, obstacles: Obstacle) -> Float[Array, "n_agent top_k_rays 2"]:
+    #     lidar_data = None
+    #     if self.params["n_obs"] > 0:
+    #         get_lidar_vmap = jax_vmap(
+    #             ft.partial(
+    #                 get_lidar,
+    #                 obstacles=obstacles,
+    #                 num_beams=self._params["n_rays"],
+    #                 sense_range=self._params["comm_radius"],
+    #                 max_returns=32
+    #             )
+    #         )
+    #         lidar_data = get_lidar_vmap(states[:, :2])
+    #         assert lidar_data.shape == (self.num_agents, 32, 2)
+    #     return lidar_data
 
     def get_lidar_data(self, states: State, obstacles: Obstacle) -> Float[Array, "n_agent top_k_rays 2"]:
         lidar_data = None
@@ -516,11 +761,45 @@ class LidarEnv(MultiAgentEnv, ABC):
             assert lidar_data.shape == (self.num_agents, self._params["top_k_rays"], 2)
         return lidar_data
 
+    def get_semantic_lidar_data(
+        self,
+        states: State,
+        obstacles,
+        bridge_center: jnp.ndarray,
+        bridge_gap_width: jnp.ndarray,
+        bridge_wall_thickness: jnp.ndarray,
+        bridge_theta: jnp.ndarray,
+        terrain_config: jnp.ndarray,
+    ) -> Tuple[jnp.ndarray, jnp.ndarray]:
+        """
+        Per-ray semantic lidar.
+        Returns:
+            lidar_data:   (n_agents, 2*n_rays, 2)  hit positions
+            terrain_ids:  (n_agents, 2*n_rays)     terrain ID per hit
+        First n_rays entries per agent = obstacle hits; last n_rays = target-terrain boundary hits.
+        """
+        lidar_data, terrain_ids = jax_vmap(
+            ft.partial(
+                _get_semantic_lidar_single,
+                obstacles=obstacles,
+                bridge_center=bridge_center,
+                bridge_gap_width=bridge_gap_width,
+                bridge_wall_thickness=bridge_wall_thickness,
+                bridge_theta=bridge_theta,
+                terrain_config=terrain_config,
+                num_beams=self._params["n_rays"],
+                sense_range=self._params["comm_radius"],
+            )
+        )(states[:, :2])
+        return lidar_data, terrain_ids  # (n_agents, 2*n_rays, 2), (n_agents, 2*n_rays)
+
     def agent_step_euler(self, agent_states: AgentState, action: Action) -> AgentState:
         assert action.shape == (self.num_agents, self.action_dim)
         assert agent_states.shape == (self.num_agents, self.state_dim)
-        x_dot = jnp.concatenate([agent_states[:, 2:], action * 10.], axis=1)
-        n_state_agent_new = x_dot * self.dt + agent_states
+        # Velocity control: action is directly the velocity command, scaled to state limits
+        vel = action * 0.5  # action in [-1,1] -> velocity in [-0.5, 0.5]
+        next_pos = agent_states[:, :2] + vel * self.dt
+        n_state_agent_new = jnp.concatenate([next_pos, vel], axis=1)
         assert n_state_agent_new.shape == (self.num_agents, self.state_dim)
         return self.clip_state(n_state_agent_new)
 
@@ -536,6 +815,7 @@ class LidarEnv(MultiAgentEnv, ABC):
         bridge_gap_width = graph.env_states.bridge_gap_width
         bridge_wall_thickness = graph.env_states.bridge_wall_thickness
         bridge_theta = graph.env_states.bridge_theta
+        terrain_config = graph.env_states.terrain_config
         
         cos_theta = jnp.cos(bridge_theta)
         sin_theta = jnp.sin(bridge_theta)
@@ -573,28 +853,56 @@ class LidarEnv(MultiAgentEnv, ABC):
         # calculate next states
         action = self.clip_action(action)
         next_agent_base_states = self.agent_step_euler(agent_base_states, action) # Only update (x,y,vx,vy)
-        
+
+        # --- Terrain one-hot: geometry-based detection on next positions ---
+        next_terrain_ids = jax_vmap(
+            ft.partial(
+                get_terrain_id,
+                bridge_center=bridge_center,
+                bridge_gap_width=bridge_gap_width,
+                bridge_wall_thickness=bridge_wall_thickness,
+                bridge_theta=bridge_theta,
+                terrain_config=terrain_config,
+            )
+        )(next_agent_base_states[:, :2])  # (n_agents,)
+        next_terrain_oh = jax.nn.one_hot(next_terrain_ids, self.terrain_oh_dim)  # (n_agents, 3)
+
+        # jd.print("[TERRAIN STEP DEBUG] agent positions: {}", next_agent_base_states[:, :2])
+        # jd.print("[TERRAIN STEP DEBUG] terrain_ids (0=Road,1=Grass,2=Sidewalk): {}", next_terrain_ids)
+        # jd.print("[TERRAIN STEP DEBUG] terrain_oh: {}", next_terrain_oh)
+
         reward, bonus_awarded_updated = self.get_reward(graph, action)
         cost = self.get_cost(graph)
         assert reward.shape == tuple()
 
+        lidar_data_next, lidar_terrain_ids_next = self.get_semantic_lidar_data(
+            next_agent_base_states, obstacles,
+            bridge_center, bridge_gap_width,
+            bridge_wall_thickness, bridge_theta, terrain_config,
+        )
+        lidar_hit_terrain_ids_next = merge01(lidar_terrain_ids_next)  # (n_agents * 2*n_rays,)
+        lidar_hit_positions_next   = merge01(lidar_data_next)         # (n_agents * 2*n_rays, 2)
+
         next_env_state = LidarEnvState(
-            next_agent_base_states, 
-            goals, 
+            next_agent_base_states,
+            goals,
             obstacles,
-            bearing, 
+            bearing,
             current_cluster_oh,
             start_cluster_oh,
             next_cluster_oh,
             bonus_awarded_updated,
+            next_terrain_oh,
+            lidar_hit_terrain_ids_next,
+            lidar_hit_positions_next,
             bridge_center,
             bridge_length,
             bridge_gap_width,
             bridge_wall_thickness,
-            bridge_theta
+            bridge_theta,
+            terrain_config,
         )
-        
-        lidar_data_next = self.get_lidar_data(next_agent_base_states, obstacles)
+
         info = {}
         done = jnp.array(False)
 
@@ -613,14 +921,18 @@ class LidarEnv(MultiAgentEnv, ABC):
         min_dist = jnp.min(dist, axis=1)
         agent_cost: Array = self.params["car_radius"] * 2 - min_dist
 
-        # collision between agents and obstacles
+        # Hard collision cost: only obstacle hit nodes (first top_k per agent in graph).
+        # Boundary hit nodes are NOT obstacles — they are soft terrain navigation signals.
         if self.params['n_obs'] == 0:
             obs_cost = jnp.zeros((self.num_agents,)).astype(jnp.float32)
         else:
-            obs_pos = graph.type_states(type_idx=2, n_type=self._params["top_k_rays"] * self.num_agents)[:, :2]
-            obs_pos = jnp.reshape(obs_pos, (self.num_agents, self._params["top_k_rays"], 2))
-            dist = jnp.linalg.norm(obs_pos - agent_pos[:, None, :], axis=-1)  # (n_agent, top_k_rays)
-            obs_cost: Array = self.params["car_radius"] - dist.min(axis=1)  # (n_agent,)
+            top_k = self._params["top_k_rays"]
+            all_hit_nodes = graph.type_states(type_idx=2, n_type=2 * top_k * self.num_agents)[:, :2]
+            # Reshape to (n_agents, 2*top_k, 2); first top_k per agent = obstacle hits
+            all_hit_nodes = jnp.reshape(all_hit_nodes, (self.num_agents, 2 * top_k, 2))
+            obs_pos = all_hit_nodes[:, :top_k, :]                      # (n_agents, top_k, 2)
+            dist = jnp.linalg.norm(obs_pos - agent_pos[:, None, :], axis=-1)  # (n_agents, top_k)
+            obs_cost: Array = self.params["car_radius"] - dist.min(axis=1)  # (n_agents,)
 
         cost = jnp.concatenate([agent_cost[:, None], obs_cost[:, None]], axis=1)
         assert cost.shape == (self.num_agents, self.n_cost)
@@ -658,7 +970,7 @@ class LidarEnv(MultiAgentEnv, ABC):
             side_length=self.area_size,
             dim=2,
             n_agent=self.num_agents,
-            n_rays=self.params["top_k_rays"] if self.params["n_obs"] > 0 or self.params["num_bridges"] > 0 else 0,
+            n_rays=2 * self.params["top_k_rays"] if self.params["n_obs"] > 0 or self.params["num_bridges"] > 0 else 0,
             r=self.params["car_radius"],
             obs_r=0.0, #
             cost_components=self.cost_components,
@@ -674,43 +986,65 @@ class LidarEnv(MultiAgentEnv, ABC):
         pass
     
     def get_graph(self, state: LidarEnvState, lidar_data: Pos2d = None) -> GraphsTuple:
-        n_hits = 8  
+        n_rays = self._params["n_rays"]
+        top_k  = self._params["top_k_rays"]
+        # Graph uses top-k per type; rewards use full data from env_states
+        n_hits  = 2 * top_k * self.num_agents
         n_nodes = self.num_agents + self.num_goals + n_hits
 
+        # ── Select top-k obstacle and boundary hits per agent ──────────────
         if lidar_data is not None:
-            lidar_data = merge01(lidar_data)
-        elif n_hits > 0:
-            lidar_data = jnp.zeros((n_hits, 2), dtype=jnp.float32)
+            # lidar_data: (n_agents, 2*n_rays, 2)
+            tid_per_agent = jnp.reshape(
+                state.lidar_hit_terrain_ids[:2 * n_rays * self.num_agents],
+                (self.num_agents, 2 * n_rays),
+            )
+            ld_topk, tids_topk = jax_vmap(
+                ft.partial(_topk_hits_per_agent, n_rays=n_rays, top_k=top_k)
+            )(lidar_data, tid_per_agent, state.agent[:, :2])
+            # ld_topk: (n_agents, 2*top_k, 2)  |  tids_topk: (n_agents, 2*top_k)
+            lidar_data_g = merge01(ld_topk)    # (n_agents * 2*top_k, 2)
+            tids_g       = merge01(tids_topk)  # (n_agents * 2*top_k,)
+        else:
+            lidar_data_g = jnp.zeros((n_hits, 2), dtype=jnp.float32)
+            tids_g       = jnp.ones(n_hits, dtype=jnp.int32)  # default Grass
 
-        # Node features: (x, y, vx, vy, bearing, current_cluster_oh, start_cluster_oh, next_cluster_oh, is_obs, is_goal, is_agent)
+        # Node feature layout:
+        #   [:state_dim]       — kinematic state
+        #   [state_dim]        — bearing
+        #   [+n_cluster*3]     — current/start/next cluster OH
+        #   [+terrain_oh_dim]  — terrain OH
+        #   [IND+0] is_obs | [IND+1] is_terrain_boundary | [IND+2] is_goal | [IND+3] is_agent
+        IND = self.state_dim + self.bearing_dim + 3 * self.n_cluster + self.terrain_oh_dim
         node_feats = jnp.zeros((n_nodes, self.node_dim), dtype=jnp.float32)
 
-        agent_start_idx = 0
-        # Base state
-        node_feats = node_feats.at[agent_start_idx:agent_start_idx+self.num_agents, :self.state_dim].set(state.agent)
-        # Bearing
-        node_feats = node_feats.at[agent_start_idx:agent_start_idx+self.num_agents, self.state_dim].set(state.bearing)
-        # Current cluster
-        node_feats = node_feats.at[agent_start_idx:agent_start_idx+self.num_agents, self.state_dim+self.bearing_dim:self.state_dim+self.bearing_dim+self.n_cluster].set(state.current_cluster_oh)
-        # Start cluster
-        node_feats = node_feats.at[agent_start_idx:agent_start_idx+self.num_agents, self.state_dim+self.bearing_dim+self.n_cluster:self.state_dim+self.bearing_dim+2*self.n_cluster].set(state.start_cluster_oh)
-        # Next cluster
-        node_feats = node_feats.at[agent_start_idx:agent_start_idx+self.num_agents, self.state_dim+self.bearing_dim+2*self.n_cluster:self.state_dim+self.bearing_dim+3*self.n_cluster].set(state.next_cluster_oh)
-        # Is agent indicator (last of 3)
-        node_feats = node_feats.at[agent_start_idx:agent_start_idx+self.num_agents, self.state_dim+self.bearing_dim+3*self.n_cluster+2].set(1.0)
+        # Agent nodes
+        node_feats = node_feats.at[:self.num_agents, :self.state_dim].set(state.agent)
+        node_feats = node_feats.at[:self.num_agents, self.state_dim].set(state.bearing)
+        node_feats = node_feats.at[:self.num_agents, self.state_dim+self.bearing_dim:self.state_dim+self.bearing_dim+self.n_cluster].set(state.current_cluster_oh)
+        node_feats = node_feats.at[:self.num_agents, self.state_dim+self.bearing_dim+self.n_cluster:self.state_dim+self.bearing_dim+2*self.n_cluster].set(state.start_cluster_oh)
+        node_feats = node_feats.at[:self.num_agents, self.state_dim+self.bearing_dim+2*self.n_cluster:self.state_dim+self.bearing_dim+3*self.n_cluster].set(state.next_cluster_oh)
+        node_feats = node_feats.at[:self.num_agents, self.state_dim+self.bearing_dim+3*self.n_cluster:IND].set(state.current_terrain_oh)
+        node_feats = node_feats.at[:self.num_agents, IND+3].set(1.0)  # is_agent
 
-        # Goal features
-        goal_start_idx = self.num_agents
-        node_feats = node_feats.at[goal_start_idx:goal_start_idx+self.num_goals, :self.state_dim].set(state.goal)
-        # Is goal indicator (middle)
-        node_feats = node_feats.at[goal_start_idx:goal_start_idx+self.num_goals, self.state_dim+self.bearing_dim+3*self.n_cluster+1].set(1.0)
+        # Goal nodes
+        node_feats = node_feats.at[self.num_agents:self.num_agents+self.num_goals, :self.state_dim].set(state.goal)
+        node_feats = node_feats.at[self.num_agents:self.num_agents+self.num_goals, IND+2].set(1.0)  # is_goal
 
-        # Obstacle (lidar hits)
-        if n_hits > 0 and lidar_data is not None:
-            obs_start_idx = self.num_agents + self.num_goals
-            node_feats = node_feats.at[obs_start_idx:obs_start_idx+n_hits, :2].set(lidar_data)
-            # Is obs indicator (first)
-            node_feats = node_feats.at[obs_start_idx:obs_start_idx+n_hits, self.state_dim+self.bearing_dim+3*self.n_cluster].set(1.0)
+        # Lidar hit nodes (top-k per type per agent)
+        n_obs_g = top_k * self.num_agents
+        n_bnd_g = top_k * self.num_agents
+        obs_s   = self.num_agents + self.num_goals
+        bnd_s   = obs_s + n_obs_g
+
+        node_feats = node_feats.at[obs_s:obs_s+n_obs_g, :2].set(lidar_data_g[:n_obs_g])
+        node_feats = node_feats.at[bnd_s:bnd_s+n_bnd_g, :2].set(lidar_data_g[n_obs_g:])
+
+        hit_terrain_oh = jax.nn.one_hot(tids_g[:n_hits], self.terrain_oh_dim)
+        node_feats = node_feats.at[obs_s:obs_s+n_obs_g, self.state_dim+self.bearing_dim+3*self.n_cluster:IND].set(hit_terrain_oh[:n_obs_g])
+        node_feats = node_feats.at[bnd_s:bnd_s+n_bnd_g, self.state_dim+self.bearing_dim+3*self.n_cluster:IND].set(hit_terrain_oh[n_obs_g:])
+        node_feats = node_feats.at[obs_s:obs_s+n_obs_g, IND+0].set(1.0)  # is_obs
+        node_feats = node_feats.at[bnd_s:bnd_s+n_bnd_g, IND+1].set(1.0)  # is_terrain_boundary
 
         # Node types
         node_type = -jnp.ones(n_nodes, dtype=jnp.int32)
@@ -719,23 +1053,22 @@ class LidarEnv(MultiAgentEnv, ABC):
         if n_hits > 0:
             node_type = node_type.at[self.num_agents+self.num_goals:].set(LidarEnv.OBS)
 
-        edge_blocks = self.edge_blocks(state, lidar_data)
+        edge_blks = self.edge_blocks(state, lidar_data_g)
 
-        # Raw states
+        # Raw states (top-k positions for graph, consistent with node_feats)
         raw_states = jnp.concatenate([state.agent, state.goal], axis=0)
-        if lidar_data is not None:
-            lidar_states_padded = jnp.concatenate(
-                [lidar_data, jnp.zeros((n_hits, self.state_dim - 2), dtype=lidar_data.dtype)],
-                axis=1
-            )
-            raw_states = jnp.concatenate([raw_states, lidar_states_padded], axis=0)
+        lidar_states_padded = jnp.concatenate(
+            [lidar_data_g, jnp.zeros((n_hits, self.state_dim - 2), dtype=lidar_data_g.dtype)],
+            axis=1,
+        )
+        raw_states = jnp.concatenate([raw_states, lidar_states_padded], axis=0)
 
         return GetGraph(
             nodes=node_feats,
             node_type=node_type,
-            edge_blocks=edge_blocks,
+            edge_blocks=edge_blks,
             env_states=state,
-            states=raw_states
+            states=raw_states,
         ).to_padded()
     
     def state_lim(self, state: Optional[State] = None) -> Tuple[State, State]:
