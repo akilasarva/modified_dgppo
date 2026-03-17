@@ -327,6 +327,99 @@ class LidarTarget(LidarEnv):
 
         return reward*0.1, next_cluster_bonus_awarded_updated
 
+    def get_reward_components(self, graph: LidarEnvGraphsTuple) -> dict:
+        """Returns individual reward components as a flat dict for wandb logging.
+        Call outside JIT (trainer eval loop) on a single graph."""
+        agent_states = graph.type_states(type_idx=0, n_type=self.num_agents)
+        env_states = graph.env_states
+        agent_vel = agent_states[:, 2:4]
+        bearing = env_states.bearing
+        current_terrain_oh = env_states.current_terrain_oh
+        current_terrain_id = jnp.argmax(current_terrain_oh, axis=-1)
+        is_bridge_env = env_states.bridge_length > 0.0
+
+        actual_cluster_id = jnp.argmax(env_states.current_cluster_oh, axis=-1)
+        next_cluster_id = jnp.argmax(env_states.next_cluster_oh, axis=-1)
+        is_in_next_cluster = (actual_cluster_id == next_cluster_id)
+
+        # Bearing reward
+        bearing_r = jnp.where(
+            ~is_in_next_cluster,
+            jax_vmap(_calculate_bearing_reward, in_axes=(0, 0))(agent_vel, bearing).mean(),
+            0.0,
+        ).mean() * self.COSINE_SIM_REWARD_COEFF
+
+        # Immediate terrain penalties
+        road_penalty  = jnp.where(current_terrain_id == 0, -1.0, 0.0)
+        grass_penalty = jnp.where(current_terrain_id == 1, -0.3, 0.0)
+        immediate_r = float(jnp.where(
+            is_bridge_env,
+            (road_penalty + grass_penalty).mean() * self.TERRAIN_PENALTY_COEFF,
+            0.0,
+        ))
+
+        # Speed penalty on wrong terrain
+        not_on_sidewalk = (current_terrain_id != TARGET_TERRAIN_ID)
+        speed_sq = jnp.linalg.norm(agent_vel, axis=1) ** 2
+        speed_r = -float(jnp.where(
+            is_bridge_env,
+            jnp.where(not_on_sidewalk, speed_sq, 0.0).mean() * self.WRONG_TERRAIN_SPEED_COEFF,
+            0.0,
+        ))
+
+        # Semantic lidar components
+        n_rays = self._params["n_rays"]
+        sense_range = self._params["comm_radius"]
+        all_hit_pos = jnp.reshape(
+            env_states.lidar_hit_positions[: 2 * n_rays * self.num_agents],
+            (self.num_agents, 2 * n_rays, 2),
+        )
+        boundary_hit_pos = all_hit_pos[:, n_rays:, :]
+        all_terrain_ids = jnp.reshape(
+            env_states.lidar_hit_terrain_ids[: 2 * n_rays * self.num_agents],
+            (self.num_agents, 2 * n_rays),
+        )
+        boundary_terrain_ids = all_terrain_ids[:, n_rays:]
+        agent_pos = agent_states[:, :2]
+
+        per_agent_terrain = jax_vmap(
+            ft.partial(_terrain_reward_per_agent, sense_range=sense_range)
+        )(boundary_hit_pos, boundary_terrain_ids, agent_pos, current_terrain_id)
+        terrain_r = float(jnp.where(
+            is_bridge_env, jnp.mean(per_agent_terrain) * self.TERRAIN_REWARD_COEFF, 0.0
+        ))
+
+        per_agent_pref = jax_vmap(
+            ft.partial(_calculate_preference_vector_reward, sense_range=sense_range),
+            in_axes=(0, 0, 0, 0, 0, 0),
+        )(boundary_hit_pos, boundary_terrain_ids, agent_pos, agent_vel, current_terrain_id, bearing)
+        pref_r = float(jnp.where(
+            is_bridge_env, per_agent_pref.mean() * self.PREF_VECTOR_REWARD_COEFF, 0.0
+        ))
+
+        # Current terrain distribution
+        terrain_names = {0: "road", 1: "grass", 2: "sidewalk"}
+        terrain_fracs = {
+            f"eval/terrain_frac_{name}": float((current_terrain_id == tid).mean())
+            for tid, name in terrain_names.items()
+        }
+
+        # Cost components: agent-agent vs obstacle
+        cost = self.get_cost(graph)  # (n_agents, 2): col 0=agent-agent, col 1=obstacle
+        cost_agent_agent = float(jnp.maximum(cost[:, 0], 0.0).mean())
+        cost_obstacle    = float(jnp.maximum(cost[:, 1], 0.0).mean())
+
+        return {
+            "eval/reward_bearing":           float(bearing_r),
+            "eval/reward_terrain_immediate": immediate_r,
+            "eval/reward_speed_penalty":     speed_r,
+            "eval/reward_terrain_midrange":  terrain_r,
+            "eval/reward_pref_vector":       pref_r,
+            "eval/cost_agent_agent":         cost_agent_agent,
+            "eval/cost_obstacle":            cost_obstacle,
+            **terrain_fracs,
+        }
+
     def state2feat(self, state: State) -> Array:
         return state
 

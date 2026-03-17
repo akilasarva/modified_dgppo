@@ -215,6 +215,16 @@ class Trainer:
                     "eval/cost": cost,
                     "eval/unsafe_frac": unsafe_frac,
                 }
+
+                # Log individual reward components from the last step of the first test env
+                if hasattr(self.env_test, 'get_reward_components'):
+                    try:
+                        last_graph = jax.tree_util.tree_map(
+                            lambda x: x[0, -1], test_rollouts.graph
+                        )
+                        eval_info |= self.env_test.get_reward_components(last_graph)
+                    except Exception as e:
+                        tqdm.write(f"Warning: get_reward_components failed: {e}")
                 time_since_start = time() - start_time
                 eval_verbose = (f'step: {step:3}, time: {time_since_start:5.0f}s, reward: {reward_mean:9.4f}, '
                                 f'min/max reward: {reward_min:7.2f}/{reward_max:7.2f}, cost: {cost:8.4f}, '
