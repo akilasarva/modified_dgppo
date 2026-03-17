@@ -105,7 +105,8 @@ def _terrain_reward_per_agent(
     dists     = jnp.linalg.norm(boundary_hit_positions - agent_pos[None, :], axis=-1)  # (n_rays,)
     proximity = jnp.where(dists < sense_range, 1.0 - dists / sense_range, 0.0)         # (n_rays,)
 
-    return (delta_v * proximity).mean()
+    on_target = (current_terrain_id == TARGET_TERRAIN_ID)
+    return jnp.where(on_target, 0.0, (delta_v * proximity).mean())
 
 
 def _calculate_preference_vector_reward(
