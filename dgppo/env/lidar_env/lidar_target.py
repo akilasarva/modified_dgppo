@@ -171,16 +171,16 @@ def _calculate_preference_vector_reward(
 
 class LidarTarget(LidarEnv):
 
-    COSINE_SIM_REWARD_COEFF = 0.5        # global waypoint bearing alignment (direction only)
-    NEXT_CLUSTER_BONUS = 4.0
+    COSINE_SIM_REWARD_COEFF = 0.2        # reduced: terrain penalty now dominates over bearing
+    NEXT_CLUSTER_BONUS = 40.0            # one-time; effective = 4.0 after global scale
     INCORRECT_CLUSTER_PENALTY = -2.0
-    STAY_IN_CLUSTER_BONUS = 0.2
-    VELOCITY_PENALTY_IN_CLUSTER = -2
-    TERRAIN_REWARD_COEFF = 0.5           # mid-range: per-ray delta terrain value
-    PREF_VECTOR_REWARD_COEFF = 0.5       # long-range: preference vector alignment
-    TERRAIN_PENALTY_COEFF = 0.2          # immediate: road/grass occupancy penalty
-    ROAD_SPEED_COEFF = 0.1               # slight slowdown on road terrain
-    GRASS_SPEED_COEFF = 0.3              # more slowdown on grass terrain
+    STAY_IN_CLUSTER_BONUS = 0.5          # continuous; effective = 0.05/step
+    VELOCITY_PENALTY_IN_CLUSTER = -0.1   # soft nudge only — velocity not a priority in cluster
+    TERRAIN_REWARD_COEFF = 0.0           # disabled: mid-range semantic lidar (set >0 to re-enable)
+    PREF_VECTOR_REWARD_COEFF = 0.0       # disabled: preference vector (set >0 to re-enable)
+    TERRAIN_PENALTY_COEFF = 0.5          # raised: road=-6.4/ep, 2.5x stronger than max bearing
+    ROAD_SPEED_COEFF = 0.05              # mild bump — discourages fast road traversal
+    GRASS_SPEED_COEFF = 0.1              # mild bump — discourages fast grass traversal
 
     PARAMS = {
         "car_radius": 0.02,
@@ -357,12 +357,13 @@ class LidarTarget(LidarEnv):
             0.0,
         ))
 
-        # Speed penalty on wrong terrain
-        not_on_sidewalk = (current_terrain_id != TARGET_TERRAIN_ID)
+        # Speed penalty on wrong terrain (terrain-graded)
         speed_sq = jnp.linalg.norm(agent_vel, axis=1) ** 2
+        road_speed_pen  = jnp.where(current_terrain_id == 0, speed_sq * self.ROAD_SPEED_COEFF,  0.0)
+        grass_speed_pen = jnp.where(current_terrain_id == 1, speed_sq * self.GRASS_SPEED_COEFF, 0.0)
         speed_r = -float(jnp.where(
             is_bridge_env,
-            jnp.where(not_on_sidewalk, speed_sq, 0.0).mean() * self.WRONG_TERRAIN_SPEED_COEFF,
+            (road_speed_pen + grass_speed_pen).mean(),
             0.0,
         ))
 
