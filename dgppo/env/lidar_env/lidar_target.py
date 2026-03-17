@@ -18,8 +18,9 @@ ALL_POSSIBLE_REGION_NAMES = [
 
 def _calculate_bearing_reward(agent_vel: jnp.ndarray, target_bearing: float) -> float:
     target_vector = jnp.array([jnp.cos(target_bearing), jnp.sin(target_bearing)])
-
-    return jnp.dot(agent_vel, target_vector)  # speed x alignment (not normalized)
+    norm_agent_vel = jnp.linalg.norm(agent_vel)
+    safe_norm_agent_vel = jnp.where(norm_agent_vel > 1e-6, norm_agent_vel, 1e-6)
+    return jnp.dot(agent_vel, target_vector) / safe_norm_agent_vel  # direction only
 
 def _calculate_cluster_reward_per_agent(
     current_cluster_oh_episode_i: Array,
@@ -170,7 +171,7 @@ def _calculate_preference_vector_reward(
 
 class LidarTarget(LidarEnv):
 
-    COSINE_SIM_REWARD_COEFF = 0.5        # global waypoint bearing alignment (speed x direction)
+    COSINE_SIM_REWARD_COEFF = 0.5        # global waypoint bearing alignment (direction only)
     NEXT_CLUSTER_BONUS = 4.0
     INCORRECT_CLUSTER_PENALTY = -2.0
     STAY_IN_CLUSTER_BONUS = 0.2
@@ -178,7 +179,8 @@ class LidarTarget(LidarEnv):
     TERRAIN_REWARD_COEFF = 0.5           # mid-range: per-ray delta terrain value
     PREF_VECTOR_REWARD_COEFF = 0.5       # long-range: preference vector alignment
     TERRAIN_PENALTY_COEFF = 0.2          # immediate: road/grass occupancy penalty
-    WRONG_TERRAIN_SPEED_COEFF = 0.3      # immediate: speed penalty when off sidewalk
+    ROAD_SPEED_COEFF = 0.1               # slight slowdown on road terrain
+    GRASS_SPEED_COEFF = 0.3              # more slowdown on grass terrain
 
     PARAMS = {
         "car_radius": 0.02,
@@ -281,12 +283,12 @@ class LidarTarget(LidarEnv):
         immediate_terrain_penalty = (road_penalty + grass_penalty + sidewalk_bonus).mean()
         reward += jnp.where(is_bridge_env, immediate_terrain_penalty * self.TERRAIN_PENALTY_COEFF, 0.0)
 
-        # ── Speed penalty when on non-target terrain ─────────────────────────
-        # Discourage fast movement on Road or Grass (rough/dangerous terrain).
-        not_on_sidewalk = (current_terrain_id != TARGET_TERRAIN_ID)
+        # ── Speed penalty: terrain-graded (road=slight, grass=more, sidewalk=none) ──
         speed_sq = jnp.linalg.norm(agent_vel, axis=1) ** 2
-        wrong_terrain_speed = jnp.where(not_on_sidewalk, speed_sq, 0.0).mean()
-        reward -= jnp.where(is_bridge_env, wrong_terrain_speed * self.WRONG_TERRAIN_SPEED_COEFF, 0.0)
+        road_speed_pen  = jnp.where(current_terrain_id == 0, speed_sq * self.ROAD_SPEED_COEFF,  0.0)
+        grass_speed_pen = jnp.where(current_terrain_id == 1, speed_sq * self.GRASS_SPEED_COEFF, 0.0)
+        terrain_speed_penalty = (road_speed_pen + grass_speed_pen).mean()
+        reward -= jnp.where(is_bridge_env, terrain_speed_penalty, 0.0)
 
         # ── Semantic lidar rewards (mid-range + long-range from lidar data) ──
         # is_bridge_env is a JAX array — no Python if; gate with jnp.where per term.
