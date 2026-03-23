@@ -22,6 +22,75 @@ from dgppo.env.utils import get_lidar, get_node_goal_rng
 from dgppo.env.building_behavior_associator import BehaviorBuildings
 
 
+TERRAIN_NAMES = ["road", "sidewalk", "grass"]  # id: 0=road, 1=sidewalk, 2=grass
+
+
+def get_building_terrain_id(
+    agent_pos: Array,          # shape (2,)
+    building_center: Array,    # shape (2,)
+    building_width: float,
+    building_height: float,
+    building_theta: float,
+    area_size: float,
+    terrain_config: int,
+) -> int:
+    """
+    Returns terrain ID for agent_pos given building geometry and terrain_config.
+    Terrain IDs: 0=road, 1=sidewalk, 2=grass
+
+    Building terrain configs:
+      Config 1: [inside->grass] [0-0.15 from surface->sidewalk] [farther->road]
+      Config 2: [inside->grass] [0-0.15 from surface->sidewalk] [0.15+->road] [within 0.2 of env boundary->sidewalk]
+      Config 3: [inside->grass] [0-0.10 from surface->grass halo] [0.10-0.25->sidewalk ring] [farther->road]
+    """
+    # Rotate agent into building-local frame
+    cos_t = jnp.cos(-building_theta)
+    sin_t = jnp.sin(-building_theta)
+    rel = agent_pos - building_center
+    local_x = cos_t * rel[0] - sin_t * rel[1]
+    local_y = sin_t * rel[0] + cos_t * rel[1]
+
+    half_w = building_width / 2.0
+    half_h = building_height / 2.0
+
+    # Distance from building surface (0 at surface, positive outside, negative inside clamped to 0)
+    dx = jnp.maximum(jnp.abs(local_x) - half_w, 0.0)
+    dy = jnp.maximum(jnp.abs(local_y) - half_h, 0.0)
+    dist_to_surface = jnp.sqrt(dx ** 2 + dy ** 2)
+
+    inside_building = (jnp.abs(local_x) <= half_w) & (jnp.abs(local_y) <= half_h)
+
+    # Distance from env boundary (env coords 0..area_size)
+    dist_to_boundary = jnp.minimum(
+        jnp.minimum(agent_pos[0], area_size - agent_pos[0]),
+        jnp.minimum(agent_pos[1], area_size - agent_pos[1])
+    )
+    near_boundary = dist_to_boundary < 0.2
+
+    # Config 1: perimeter sidewalk (0-0.15), rest road, inside grass
+    terrain_c1 = jnp.where(inside_building, 2,
+                 jnp.where(dist_to_surface <= 0.15, 1,   # sidewalk
+                 0))                                       # road
+
+    # Config 2: perimeter sidewalk (0-0.15), middle road, outer border sidewalk
+    terrain_c2 = jnp.where(inside_building, 2,
+                 jnp.where(dist_to_surface <= 0.15, 1,   # inner sidewalk
+                 jnp.where(near_boundary, 1,              # outer sidewalk
+                 0)))                                      # road
+
+    # Config 3: grass halo (0-0.10), sidewalk ring (0.10-0.25), rest road
+    terrain_c3 = jnp.where(inside_building, 2,
+                 jnp.where(dist_to_surface <= 0.10, 2,   # grass halo
+                 jnp.where(dist_to_surface <= 0.25, 1,   # sidewalk ring
+                 0)))                                      # road
+
+    terrain_id = jnp.where(terrain_config == 1, terrain_c1,
+                 jnp.where(terrain_config == 2, terrain_c2,
+                 terrain_c3))  # config 3 default
+
+    return terrain_id
+
+
 class LidarEnvState(NamedTuple):
     agent: State
     goal: State
@@ -38,6 +107,9 @@ class LidarEnvState(NamedTuple):
     building_width: float
     building_height: float
     building_theta: float # Stored in radians
+
+    current_terrain_oh: Float[Array, "n_agent 3"]   # one-hot terrain per agent
+    terrain_config: jnp.ndarray                      # scalar int: 1, 2, or 3
 
     @property
     def n_agent(self) -> int:
@@ -290,7 +362,7 @@ class LidarEnv(MultiAgentEnv, ABC):
 
     @property
     def node_dim(self) -> int:
-        return self.state_dim + self.bearing_dim + 3 * self.cluster_oh_dim + 3
+        return self.state_dim + self.bearing_dim + 3 * self.cluster_oh_dim + 3 + 3  # +3 for terrain one-hot
     
     @property
     def edge_dim(self) -> int:
@@ -334,6 +406,10 @@ class LidarEnv(MultiAgentEnv, ABC):
         building_height_env_state: Float[Array, ""] = jnp.array(0.0)
         building_theta_env_state: Float[Array, ""] = jnp.array(0.0)
         initial_bonus_awarded = jnp.zeros(self.num_agents, dtype=jnp.bool_)
+
+        # Sample terrain_config from {1, 2, 3}
+        terrain_key, key = jr.split(key)
+        terrain_config = jr.randint(terrain_key, shape=(), minval=1, maxval=4)  # 1, 2, or 3
         
         if custom_obstacles is not None:
             obs_pos, obs_len_x, obs_len_y, obs_theta = custom_obstacles
@@ -536,12 +612,26 @@ class LidarEnv(MultiAgentEnv, ABC):
 
         assert states.shape == (self.num_agents, self.state_dim)
         assert goals.shape == (self.num_goals, self.state_dim)
-        
+
+        # Compute initial terrain one-hot for each agent
+        terrain_ids = jax_vmap(
+            ft.partial(
+                get_building_terrain_id,
+                building_center=building_center_env_state,
+                building_width=building_width_env_state,
+                building_height=building_height_env_state,
+                building_theta=building_theta_env_state,
+                area_size=self.area_size,
+                terrain_config=terrain_config,
+            )
+        )(states[:, :2])
+        initial_terrain_oh = jax.nn.one_hot(terrain_ids, num_classes=3)
+
         env_states = LidarEnvState(
-            agent=states, 
-            goal=goals, 
+            agent=states,
+            goal=goals,
             obstacle=obstacles,
-            bearing=bearing, 
+            bearing=bearing,
             current_cluster_oh=current_clusters,
             start_cluster_oh=start_clusters,
             next_cluster_oh=next_clusters,
@@ -550,6 +640,8 @@ class LidarEnv(MultiAgentEnv, ABC):
             building_width=building_width_env_state,
             building_height=building_height_env_state,
             building_theta=building_theta_env_state,
+            current_terrain_oh=initial_terrain_oh,
+            terrain_config=terrain_config,
         )
 
         lidar_data = self.get_lidar_data(states, obstacles)
@@ -604,6 +696,7 @@ class LidarEnv(MultiAgentEnv, ABC):
 
         # Also pass through the bearing and cluster info from the previous step's env_states
         bearing = graph.env_states.bearing
+        terrain_config = graph.env_states.terrain_config
         from dgppo.env.building_behavior_associator import BehaviorBuildings
         associator = BehaviorBuildings(
             buildings=building_params,
@@ -624,21 +717,36 @@ class LidarEnv(MultiAgentEnv, ABC):
         cost = self.get_cost(graph)
         assert reward.shape == tuple()
         
+        # Recompute terrain one-hot for next agent positions
+        next_terrain_ids = jax_vmap(
+            ft.partial(
+                get_building_terrain_id,
+                building_center=building_center,
+                building_width=building_width,
+                building_height=building_height,
+                building_theta=building_theta,
+                area_size=self.area_size,
+                terrain_config=terrain_config,
+            )
+        )(next_agent_base_states[:, :2])
+        next_terrain_oh = jax.nn.one_hot(next_terrain_ids, num_classes=3)
+
         # Reconstruct the next LidarBuildingsState
         next_env_state = LidarEnvState(
-            next_agent_base_states, 
-            goals, 
+            next_agent_base_states,
+            goals,
             obstacles,
             bearing,
             current_cluster_oh,
             start_cluster_oh,
             next_cluster_oh,
             bonus_awarded_updated,
-            # Pack the building parameters into the new state
             building_center=building_center,
             building_width=building_width,
             building_height=building_height,
             building_theta=building_theta,
+            current_terrain_oh=next_terrain_oh,
+            terrain_config=terrain_config,
         )
         
         lidar_data_next = self.get_lidar_data(next_agent_base_states, obstacles)
@@ -743,21 +851,24 @@ class LidarEnv(MultiAgentEnv, ABC):
         node_feats = node_feats.at[agent_start_idx:agent_start_idx+self.num_agents, self.state_dim+self.bearing_dim+self.n_cluster:self.state_dim+self.bearing_dim+2*self.n_cluster].set(state.start_cluster_oh)
         # Next cluster
         node_feats = node_feats.at[agent_start_idx:agent_start_idx+self.num_agents, self.state_dim+self.bearing_dim+2*self.n_cluster:self.state_dim+self.bearing_dim+3*self.n_cluster].set(state.next_cluster_oh)
-        # Is agent indicator (last of 3)
-        node_feats = node_feats.at[agent_start_idx:agent_start_idx+self.num_agents, self.state_dim+self.bearing_dim+3*self.n_cluster+2].set(1.0)
+        # Terrain one-hot (3 values)
+        terrain_oh_start = self.state_dim + self.bearing_dim + 3 * self.n_cluster
+        node_feats = node_feats.at[agent_start_idx:agent_start_idx+self.num_agents, terrain_oh_start:terrain_oh_start+3].set(state.current_terrain_oh)
+        # Is agent indicator (last of 3 type indicators, after terrain)
+        node_feats = node_feats.at[agent_start_idx:agent_start_idx+self.num_agents, terrain_oh_start+3+2].set(1.0)
 
         # Goal features
         goal_start_idx = self.num_agents
         node_feats = node_feats.at[goal_start_idx:goal_start_idx+self.num_goals, :self.state_dim].set(state.goal)
-        # Is goal indicator (middle)
-        node_feats = node_feats.at[goal_start_idx:goal_start_idx+self.num_goals, self.state_dim+self.bearing_dim+3*self.n_cluster+1].set(1.0)
+        # Is goal indicator (middle of 3 type indicators, after terrain)
+        node_feats = node_feats.at[goal_start_idx:goal_start_idx+self.num_goals, terrain_oh_start+3+1].set(1.0)
 
         # Obstacle (lidar hits)
         if n_hits > 0 and lidar_data is not None:
             obs_start_idx = self.num_agents + self.num_goals
             node_feats = node_feats.at[obs_start_idx:obs_start_idx+n_hits, :2].set(lidar_data)
-            # Is obs indicator (first)
-            node_feats = node_feats.at[obs_start_idx:obs_start_idx+n_hits, self.state_dim+self.bearing_dim+3*self.n_cluster].set(1.0)
+            # Is obs indicator (first of 3 type indicators, after terrain)
+            node_feats = node_feats.at[obs_start_idx:obs_start_idx+n_hits, terrain_oh_start+3].set(1.0)
 
         # Node types
         node_type = -jnp.ones(n_nodes, dtype=jnp.int32)

@@ -152,3 +152,86 @@ class BehaviorBuildings(BehaviorAssociator):
             properties[f"around_corner_{i}"] = {"label": "Around Corner Arc", "color": "lime", "alpha": 0.5}
 
         return properties
+
+
+def visualize_building_terrain(
+    ax,
+    building_center: np.ndarray,  # (2,) numpy array
+    building_width: float,
+    building_height: float,
+    building_theta: float,         # radians
+    side_length: float,
+    terrain_config: int = 1,
+    resolution: int = 200,
+) -> list:
+    """
+    Draw terrain zones as a raster background behind the scene.
+
+    Terrain IDs (match TERRAIN_NAMES in base.py): 0=road, 1=sidewalk, 2=grass
+
+    Config 1: perimeter sidewalk (0–0.15 from surface), rest road, inside grass
+    Config 2: perimeter sidewalk (0–0.15), middle road, outer border sidewalk (<0.2 from boundary)
+    Config 3: grass halo (0–0.10), sidewalk ring (0.10–0.25), rest road, inside grass
+
+    Returns a list of matplotlib Patch objects for use in a legend.
+    """
+    from matplotlib.patches import Patch
+
+    xs = np.linspace(0, side_length, resolution)
+    ys = np.linspace(0, side_length, resolution)
+    XX, YY = np.meshgrid(xs, ys)
+
+    # Rotate grid into building-local frame
+    cos_t = np.cos(-building_theta)
+    sin_t = np.sin(-building_theta)
+    rel_x = XX - building_center[0]
+    rel_y = YY - building_center[1]
+    local_x = cos_t * rel_x - sin_t * rel_y
+    local_y = sin_t * rel_x + cos_t * rel_y
+
+    half_w = building_width / 2.0
+    half_h = building_height / 2.0
+
+    # Distance from building surface (0 at surface, positive outside)
+    dx = np.maximum(np.abs(local_x) - half_w, 0.0)
+    dy = np.maximum(np.abs(local_y) - half_h, 0.0)
+    dist_to_surface = np.sqrt(dx**2 + dy**2)
+
+    inside_building = (np.abs(local_x) <= half_w) & (np.abs(local_y) <= half_h)
+
+    # Distance from env boundary
+    dist_to_boundary = np.minimum(
+        np.minimum(XX, side_length - XX),
+        np.minimum(YY, side_length - YY)
+    )
+    near_boundary = dist_to_boundary < 0.2
+
+    if terrain_config == 1:
+        terrain_grid = np.where(inside_building, 2,
+                       np.where(dist_to_surface <= 0.15, 1, 0))
+    elif terrain_config == 2:
+        terrain_grid = np.where(inside_building, 2,
+                       np.where(dist_to_surface <= 0.15, 1,
+                       np.where(near_boundary, 1, 0)))
+    else:  # config 3
+        terrain_grid = np.where(inside_building, 2,
+                       np.where(dist_to_surface <= 0.10, 2,
+                       np.where(dist_to_surface <= 0.25, 1, 0)))
+
+    # RGBA colours: Road=gray, Sidewalk=sandy tan, Grass=muted green
+    color_map = {
+        0: np.array([0.55, 0.55, 0.55, 0.45]),  # Road
+        1: np.array([0.88, 0.78, 0.50, 0.50]),  # Sidewalk
+        2: np.array([0.45, 0.72, 0.35, 0.35]),  # Grass
+    }
+    rgba = np.zeros((*terrain_grid.shape, 4), dtype=np.float32)
+    for tid, col in color_map.items():
+        rgba[terrain_grid == tid] = col
+
+    ax.imshow(rgba, extent=[0, side_length, 0, side_length], origin='lower', zorder=0)
+
+    return [
+        Patch(facecolor=color_map[0][:3], label="Road"),
+        Patch(facecolor=color_map[1][:3], label="Sidewalk"),
+        Patch(facecolor=color_map[2][:3], label="Grass"),
+    ]
