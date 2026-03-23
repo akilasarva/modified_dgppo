@@ -287,10 +287,93 @@ class BehaviorIntersection(BehaviorAssociator):
 
     def _get_enter_exit_id(self, passage_id, is_moving_towards):
         base_passage_idx = (passage_id - self.passage_start_id) // 2
-        
+
         # Calculate the IDs for both enter and exit
         enter_id = self.passage_start_id + base_passage_idx * 2
         exit_id = self.passage_start_id + base_passage_idx * 2 + 1
-        
+
         # Use jnp.where to choose the correct ID based on the condition
         return jnp.where(is_moving_towards, enter_id, exit_id)
+
+
+def visualize_intersection_terrain(
+    ax,
+    center: np.ndarray,    # (2,) center of intersection, in 0-to-side_length coords
+    passage_width: float,
+    global_angle: float,   # radians
+    side_length: float,
+    terrain_config: int = 1,
+    resolution: int = 200,
+) -> list:
+    """
+    Draw intersection terrain zones as a raster background.
+
+    Terrain IDs: 0=road (gray), 1=sidewalk (tan), 2=grass (green)
+
+    Config 1: road in passage, sidewalk 0–0.1 from passage edge, grass elsewhere
+    Config 2: road in passage, sidewalk 0–0.1 from edge, sidewalk near boundary, grass elsewhere
+    Config 3: road in passage, road halo 0–0.08, sidewalk ring 0.08–0.2, grass elsewhere
+    """
+    from matplotlib.patches import Patch
+
+    xs = np.linspace(0, side_length, resolution)
+    ys = np.linspace(0, side_length, resolution)
+    XX, YY = np.meshgrid(xs, ys)
+
+    # Rotate into intersection-local frame
+    cos_t = np.cos(-global_angle)
+    sin_t = np.sin(-global_angle)
+    rel_x = XX - center[0]
+    rel_y = YY - center[1]
+    local_x = cos_t * rel_x - sin_t * rel_y
+    local_y = sin_t * rel_x + cos_t * rel_y
+
+    half_pass = passage_width / 2.0
+
+    in_horizontal = np.abs(local_y) <= half_pass
+    in_vertical   = np.abs(local_x) <= half_pass
+    in_road = in_horizontal | in_vertical
+
+    # Distance from nearest road edge
+    dist_to_h_pass = np.maximum(np.abs(local_y) - half_pass, 0.0)
+    dist_to_v_pass = np.maximum(np.abs(local_x) - half_pass, 0.0)
+    dist_to_road = np.where(in_road, 0.0, np.minimum(dist_to_h_pass, dist_to_v_pass))
+
+    # Distance from env boundary (0-to-side_length coords)
+    dist_to_boundary = np.minimum(
+        np.minimum(XX, side_length - XX),
+        np.minimum(YY, side_length - YY),
+    )
+    near_boundary = dist_to_boundary < 0.2
+
+    if terrain_config == 1:
+        terrain_grid = np.where(in_road, 0,
+                       np.where(dist_to_road <= 0.1, 1,
+                       2))
+    elif terrain_config == 2:
+        terrain_grid = np.where(in_road, 0,
+                       np.where(dist_to_road <= 0.1, 1,
+                       np.where(near_boundary, 1,
+                       2)))
+    else:  # config 3
+        terrain_grid = np.where(in_road, 0,
+                       np.where(dist_to_road <= 0.08, 0,
+                       np.where(dist_to_road <= 0.2, 1,
+                       2)))
+
+    road_rgba  = (0.55, 0.55, 0.55, 0.45)
+    side_rgba  = (0.88, 0.78, 0.50, 0.50)
+    grass_rgba = (0.45, 0.72, 0.35, 0.35)
+
+    rgba = np.zeros((resolution, resolution, 4))
+    rgba[terrain_grid == 0] = road_rgba
+    rgba[terrain_grid == 1] = side_rgba
+    rgba[terrain_grid == 2] = grass_rgba
+
+    ax.imshow(rgba, extent=[0, side_length, 0, side_length], origin='lower', zorder=0)
+
+    return [
+        Patch(facecolor=road_rgba[:3],  alpha=road_rgba[3],  label="Road"),
+        Patch(facecolor=side_rgba[:3],  alpha=side_rgba[3],  label="Sidewalk"),
+        Patch(facecolor=grass_rgba[:3], alpha=grass_rgba[3], label="Grass"),
+    ]

@@ -21,7 +21,7 @@ from ..trainer.utils import centered_norm
 from ..utils.typing import EdgeIndex, Pos2d, Pos3d, Array
 from ..utils.utils import merge01, tree_index, MutablePatchCollection, save_anim
 from dgppo.env.obstacle import Cuboid, Sphere, Obstacle, Rectangle
-from dgppo.env.intersection_behavior_associator import BehaviorIntersection
+from dgppo.env.intersection_behavior_associator import BehaviorIntersection, visualize_intersection_terrain
 
 ALL_POSSIBLE_REGION_NAMES = [
     "open_space_0", "open_space_1", "open_space_2", "open_space_3",
@@ -518,6 +518,22 @@ def render_lidar(
     inter_obslen = float(first_env_state.obs_len) if hasattr(first_env_state, 'obs_len') and first_env_state.obs_len is not None else 0.0
     inter_angle = float(first_env_state.global_angle) if hasattr(first_env_state, 'global_angle') and first_env_state.global_angle is not None else 0.0 # radians
     inter_cond = bool(first_env_state.is_four_way) if hasattr(first_env_state, 'is_four_way') and first_env_state.is_four_way is not None else True
+    terrain_config_sim = int(np.array(first_env_state.terrain_config).flat[0]) if hasattr(first_env_state, 'terrain_config') else 1
+
+    _terrain_names_rl = ["Road", "Sidewalk", "Grass"]
+
+    def _terrain_str_rl(env_state):
+        if not hasattr(env_state, 'current_terrain_oh'):
+            return ""
+        oh = np.array(env_state.current_terrain_oh[:n_agent])
+        ids = np.argmax(oh, axis=-1)
+        return "Terrain: " + "  ".join(f"A{i}:{_terrain_names_rl[int(t)]}" for i, t in enumerate(ids))
+
+    terrain_font_opts_rl = dict(size=11, color="k", family="cursive", weight="normal", transform=ax.transAxes)
+    if dim == 2 and hasattr(first_env_state, 'current_terrain_oh'):
+        terrain_text_rl = ax.text(0.02, 0.02, _terrain_str_rl(first_env_state), va="bottom", **terrain_font_opts_rl)
+    else:
+        terrain_text_rl = None
 
     inters_for_associator = []
     if inter_width > 0.0:
@@ -558,10 +574,31 @@ def render_lidar(
         obstacles=obstacles_for_associator
     )
     
-    # Visualize the behavior regions
+    # Visualize terrain background (raster, drawn first at zorder=0)
+    terrain_legend_patches = []
+    if dim == 2 and inter_width > 0.0:
+        terrain_legend_patches = visualize_intersection_terrain(
+            ax,
+            center=inter_center,
+            passage_width=inter_width,
+            global_angle=inter_angle,
+            side_length=side_length,
+            terrain_config=terrain_config_sim,
+        )
+
+    # Visualize the behavior regions (cluster zones, drawn on top of terrain)
     if dim == 2:
         behavior_associator.visualize_behavior_regions(ax)
-        
+
+    # Add terrain legend if terrain was drawn
+    if terrain_legend_patches:
+        existing_handles, existing_labels = ax.get_legend_handles_labels()
+        ax.legend(
+            handles=terrain_legend_patches + existing_handles,
+            labels=[p.get_label() for p in terrain_legend_patches] + existing_labels,
+            loc="upper right", fontsize=8,
+        )
+
     # plot the first frame
     T_graph = rollout.graph
     graph0 = tree_index(T_graph, 0)
@@ -727,7 +764,8 @@ def render_lidar(
 
     # init function for animation
     def init_fn() -> list[plt.Artist]:
-        return [agent_col, edge_col, *agent_labels, cost_text, *safe_text, *cnt_col, kk_text]
+        return [agent_col, edge_col, *agent_labels, cost_text, *safe_text, *cnt_col, kk_text,
+                *([] if terrain_text_rl is None else [terrain_text_rl])]
 
     # update function for animation
     def update(kk: int) -> list[plt.Artist]:
@@ -804,7 +842,11 @@ def render_lidar(
 
         kk_text.set_text("kk={:04}".format(kk))
 
-        return [agent_col, edge_col, *agent_labels, cost_text, *safe_text, *cnt_col_t, kk_text]
+        if terrain_text_rl is not None:
+            terrain_text_rl.set_text(_terrain_str_rl(graph.env_states))
+
+        return [agent_col, edge_col, *agent_labels, cost_text, *safe_text, *cnt_col_t, kk_text,
+                *([] if terrain_text_rl is None else [terrain_text_rl])]
 
     fps = 30.0
     spf = 1 / fps

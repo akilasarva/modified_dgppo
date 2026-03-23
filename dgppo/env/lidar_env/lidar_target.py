@@ -21,13 +21,12 @@ ALL_POSSIBLE_REGION_NAMES = [
 
 def _calculate_bearing_reward(agent_vel: jnp.ndarray, target_bearing: float) -> float:
     target_vector = jnp.array([jnp.cos(target_bearing), jnp.sin(target_bearing)])
-    
-    norm_agent_vel = jnp.linalg.norm(agent_vel)
-    safe_norm_agent_vel = jnp.where(norm_agent_vel > 1e-6, norm_agent_vel, 1e-6)
-    
-    cosine_sim = jnp.dot(agent_vel, target_vector) / safe_norm_agent_vel
-
-    return cosine_sim 
+    # Dot product: rewards speed × direction (forward progress), not just heading alignment
+    return jnp.dot(agent_vel, target_vector)
+    # Old cosine similarity version (heading-only, speed-invariant):
+    # norm_agent_vel = jnp.linalg.norm(agent_vel)
+    # safe_norm_agent_vel = jnp.where(norm_agent_vel > 1e-6, norm_agent_vel, 1e-6)
+    # return jnp.dot(agent_vel, target_vector) / safe_norm_agent_vel
 
 def _calculate_cluster_reward_per_agent(
     current_cluster_oh_episode_i: Array,
@@ -79,15 +78,18 @@ def _calculate_cluster_reward_per_agent(
 
 class LidarTarget(LidarEnv):
 
-    COSINE_SIM_REWARD_COEFF = 0.075
-    NEXT_CLUSTER_BONUS = 10.0      # Significant bonus for reaching target cluster
-    INCORRECT_CLUSTER_PENALTY = -2.0 # Large penalty for moving to an unauthorized cluster
-    STAY_IN_CLUSTER_BONUS = 0.2 # A small, continuous bonus for staying in the target cluster
-    VELOCITY_PENALTY_IN_CLUSTER = -2
+    COSINE_SIM_REWARD_COEFF = 0.1
+    NEXT_CLUSTER_BONUS = 40.0           # effective = 4.0 after global *0.1
+    INCORRECT_CLUSTER_PENALTY = -2.0
+    STAY_IN_CLUSTER_BONUS = 0.5
+    VELOCITY_PENALTY_IN_CLUSTER = -2.0
+    TERRAIN_PENALTY_COEFF = 0.7
+    ROAD_SPEED_COEFF = 0.05
+    GRASS_SPEED_COEFF = 0.1
 
     # NEW: Update PARAMS 
     PARAMS = {
-        "car_radius": 0.05,
+        "car_radius": 0.02,
         "comm_radius": 0.5,
         "n_rays": 32,
         "obs_len_range": [0.3, 0.5],
@@ -142,7 +144,7 @@ class LidarTarget(LidarEnv):
             0.0 # If in the next cluster, the reward is 0.0
         ).mean()
         reward = dense_reward * self.COSINE_SIM_REWARD_COEFF
-        jdebug.print("dense: {}", reward)
+        #jdebug.print("dense: {}", reward)
 
         is_building_env = env_states.passage_width > 0
         
@@ -166,14 +168,34 @@ class LidarTarget(LidarEnv):
         next_cluster_bonus_awarded_updated = jnp.where(is_building_env, per_agent_bonus_awarded_updated, bonus_awarded_state)
 
         reward += jnp.mean(reward_cluster)
-        jdebug.print("cluster: {}", jnp.mean(reward_cluster))
+        #jdebug.print("cluster: {}", jnp.mean(reward_cluster))
 
         velocity_magnitude_sq = jnp.linalg.norm(agent_vel, axis=1) ** 2
         velocity_penalty = jnp.where(is_in_next_cluster, velocity_magnitude_sq, 0.0).mean()
         reward += velocity_penalty * self.VELOCITY_PENALTY_IN_CLUSTER
-        jdebug.print("vel: {}", velocity_penalty * self.VELOCITY_PENALTY_IN_CLUSTER)
-        
-        reward -= (jnp.linalg.norm(action, axis=1) ** 2).mean() * 0.001
+
+        # ── Terrain reward (intersection-graded) ──
+        current_terrain_oh = env_states.current_terrain_oh          # (n_agents, 3)
+        current_terrain_id = jnp.argmax(current_terrain_oh, axis=-1) # (n_agents,)
+
+        is_intersection_env = env_states.passage_width > 0
+
+        # Immediate terrain signal: road=-1.0, grass=-0.3, sidewalk=+0.5
+        # (TERRAIN_NAMES order: 0=road, 1=sidewalk, 2=grass)
+        road_mask  = (current_terrain_id == 0).astype(jnp.float32)
+        side_mask  = (current_terrain_id == 1).astype(jnp.float32)
+        grass_mask = (current_terrain_id == 2).astype(jnp.float32)
+        immediate_terrain_penalty = (road_mask * (-1.0) + grass_mask * (-0.3) + side_mask * 0.5).mean()
+        reward += jnp.where(is_intersection_env, immediate_terrain_penalty * self.TERRAIN_PENALTY_COEFF, 0.0)
+
+        # Speed penalty: terrain-graded (road=slight, grass=more, sidewalk=none)
+        speed_sq = jnp.linalg.norm(agent_vel, axis=1) ** 2
+        road_speed_pen  = jnp.where(current_terrain_id == 0, speed_sq * self.ROAD_SPEED_COEFF,  0.0)
+        grass_speed_pen = jnp.where(current_terrain_id == 2, speed_sq * self.GRASS_SPEED_COEFF, 0.0)
+        terrain_speed_penalty = (road_speed_pen + grass_speed_pen).mean()
+        reward -= jnp.where(is_intersection_env, terrain_speed_penalty, 0.0)
+
+        reward -= (jnp.linalg.norm(action, axis=1) ** 2).mean() * 0.1
 
         return reward*0.1, next_cluster_bonus_awarded_updated
     
