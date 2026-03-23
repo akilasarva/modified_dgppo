@@ -310,6 +310,15 @@ class LidarEnv(MultiAgentEnv, ABC):
         ("exit_bridge_0", "open_space"),
     ]
 
+    # Chain: when an agent reaches its next_cluster, advance to this cluster.
+    # Sequence: approach(1) → on(2) → exit(3) → open_space(0), then stop (open_space loops to itself).
+    _CHAIN_NEXT_STR: Dict[str, str] = {
+        "approach_bridge_0": "on_bridge_0",
+        "on_bridge_0":       "exit_bridge_0",
+        "exit_bridge_0":     "open_space",
+        "open_space":        "open_space",   # terminal: stay in open_space
+    }
+
     def __init__(
             self,
             num_agents: int,
@@ -347,6 +356,13 @@ class LidarEnv(MultiAgentEnv, ABC):
             self.CURRICULUM_TRANSITIONS_INT_IDS = jnp.array(allowed_id_transitions_list, dtype=jnp.int32)
         else:
             self.CURRICULUM_TRANSITIONS_INT_IDS = jnp.empty((0, 2), dtype=jnp.int32)
+
+        # Build per-cluster chain lookup: CHAIN_NEXT_IDS[i] = next cluster id after reaching cluster i.
+        chain_list = [
+            self.CLUSTER_MAP.get(self._CHAIN_NEXT_STR.get(name, name), i)
+            for i, name in enumerate(self.ALL_POSSIBLE_REGION_NAMES)
+        ]
+        self.CHAIN_NEXT_IDS = jnp.array(chain_list, dtype=jnp.int32)  # (n_cluster,)
         
     @property
     def state_dim(self) -> int:
@@ -875,6 +891,36 @@ class LidarEnv(MultiAgentEnv, ABC):
         cost = self.get_cost(graph)
         assert reward.shape == tuple()
 
+        # ── Chain advancement (eval only) ────────────────────────────────────
+        # Per-agent: when current cluster == next cluster, advance to the next
+        # phase in the chain (approach→on→exit→open_space).
+        # Gated by get_eval_info so training episodes use fixed start/next targets.
+        if get_eval_info:
+            current_next_id = jnp.argmax(next_cluster_oh, axis=-1)          # (n_agents,)
+            should_advance  = (jnp.argmax(current_cluster_oh, axis=-1) == current_next_id)  # (n_agents,)
+
+            new_next_id         = self.CHAIN_NEXT_IDS[current_next_id]       # (n_agents,)
+            advanced_next_oh    = jax.nn.one_hot(new_next_id, self.n_cluster) # (n_agents, n_cluster)
+            advanced_start_oh   = next_cluster_oh                             # new start = old next
+
+            chained_next_cluster_oh  = jnp.where(should_advance[:, None], advanced_next_oh,  next_cluster_oh)
+            chained_start_cluster_oh = jnp.where(should_advance[:, None], advanced_start_oh, start_cluster_oh)
+            bonus_awarded_updated    = jnp.where(should_advance, jnp.zeros_like(bonus_awarded_updated), bonus_awarded_updated)
+
+            # Update bearing toward the new goal centroid for agents that advanced.
+            all_centroids = jnp.stack(
+                [associator.get_region_centroid(i) for i in range(self.n_cluster)]
+            )  # (n_cluster, 2)
+            new_goal_pos = all_centroids[new_next_id]  # (n_agents, 2)
+            new_bearing  = jnp.arctan2(
+                new_goal_pos[:, 1] - next_agent_base_states[:, 1],
+                new_goal_pos[:, 0] - next_agent_base_states[:, 0],
+            )
+            bearing = jnp.where(should_advance, new_bearing, bearing)
+        else:
+            chained_next_cluster_oh  = next_cluster_oh
+            chained_start_cluster_oh = start_cluster_oh
+
         lidar_data_next, lidar_terrain_ids_next = self.get_semantic_lidar_data(
             next_agent_base_states, obstacles,
             bridge_center, bridge_gap_width,
@@ -889,8 +935,8 @@ class LidarEnv(MultiAgentEnv, ABC):
             obstacles,
             bearing,
             current_cluster_oh,
-            start_cluster_oh,
-            next_cluster_oh,
+            chained_start_cluster_oh,
+            chained_next_cluster_oh,
             bonus_awarded_updated,
             next_terrain_oh,
             lidar_hit_terrain_ids_next,

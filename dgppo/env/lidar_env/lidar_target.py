@@ -107,7 +107,7 @@ def _terrain_reward_per_agent(
 
 def _calculate_preference_vector_reward(
     boundary_hit_positions: jnp.ndarray,  # (n_rays, 2) — boundary hit positions
-    boundary_terrain_ids: jnp.ndarray,    # (n_rays,)   — other-side terrain IDs
+    boundary_terrain_ids: jnp.ndarray,    # (n_rays,)   — terrain on OTHER SIDE
     agent_pos: jnp.ndarray,               # (2,)
     agent_vel: jnp.ndarray,               # (2,)
     current_terrain_id: jnp.ndarray,      # scalar
@@ -115,12 +115,18 @@ def _calculate_preference_vector_reward(
     sense_range: float,
 ) -> float:
     """
-    Preference vector reward for one agent.
+    Road-embedding preference vector reward for one agent.
 
-    - Not in sidewalk + entry visible:  cos(vel, direction to nearest sidewalk boundary)
-    - Not in sidewalk + no entry:       cos(vel, global bearing)   ← fallback
-    - In sidewalk + both edges visible: cos(vel, direction to lateral centerline)
-    - In sidewalk + edges not visible:  cos(vel, global bearing)   ← fallback
+    Outside target terrain:
+        cos(vel, direction to nearest target boundary), or global bearing fallback.
+
+    Inside target terrain (anti-parallel boundary pairing):
+        Edge A = nearest non-target boundary.
+        Edge B = non-target boundary most anti-parallel to A (opposite side of strip).
+        road_dir = perp(B − A), sign chosen so it agrees with global bearing.
+        Blends cosine_road with a centering pull (cosine toward A–B midpoint) scaled
+        by the agent's normalised lateral offset from the strip centre.
+        Falls back to global bearing when A/B are not both visible.
     """
     dists = jnp.linalg.norm(boundary_hit_positions - agent_pos[None, :], axis=-1)  # (n_rays,)
     in_target = (current_terrain_id == TARGET_TERRAIN_ID)
@@ -132,39 +138,64 @@ def _calculate_preference_vector_reward(
     bearing_vec = jnp.array([jnp.cos(target_bearing), jnp.sin(target_bearing)])
     cosine_bearing = jnp.dot(agent_vel, bearing_vec) / safe_vel_norm
 
-    # ── Not in sidewalk: point toward nearest entry ───────────────────────
+    # ── Not in target: point toward nearest entry ─────────────────────────
     is_entry = (boundary_terrain_ids == TARGET_TERRAIN_ID)
     entry_masked = jnp.where(is_entry, dists, sense_range * 2.0)
     nearest_entry_idx = jnp.argmin(entry_masked)
-    any_entry_visible = (entry_masked[nearest_entry_idx] < sense_range)
+    any_entry_visible = entry_masked[nearest_entry_idx] < sense_range
 
     entry_dir = boundary_hit_positions[nearest_entry_idx] - agent_pos
     entry_dir_norm = entry_dir / (jnp.linalg.norm(entry_dir) + 1e-6)
     cosine_entry = jnp.where(
         any_entry_visible,
         jnp.dot(agent_vel, entry_dir_norm) / safe_vel_norm,
-        cosine_bearing,  # no sidewalk visible: follow global bearing
+        cosine_bearing,
     )
 
-    # ── In sidewalk: point toward lateral centerline ──────────────────────
-    is_road_side  = (boundary_terrain_ids == 0)
-    is_grass_side = (boundary_terrain_ids == 1)
+    # ── In target: anti-parallel boundary pairing ─────────────────────────
+    is_non_target = (boundary_terrain_ids != TARGET_TERRAIN_ID)
+    non_target_dists = jnp.where(is_non_target, dists, sense_range * 2.0)
 
-    road_masked  = jnp.where(is_road_side,  dists, sense_range * 2.0)
-    grass_masked = jnp.where(is_grass_side, dists, sense_range * 2.0)
+    # Edge A: nearest non-target boundary
+    idx_a = jnp.argmin(non_target_dists)
+    hit_a = boundary_hit_positions[idx_a]
+    dist_a = non_target_dists[idx_a]
 
-    nearest_road_hit  = boundary_hit_positions[jnp.argmin(road_masked)]
-    nearest_grass_hit = boundary_hit_positions[jnp.argmin(grass_masked)]
-    any_center_visible = (road_masked.min() < sense_range) & (grass_masked.min() < sense_range)
+    dir_a = hit_a - agent_pos
+    dir_a_norm = dir_a / (jnp.linalg.norm(dir_a) + 1e-6)
 
-    center_pos = (nearest_road_hit + nearest_grass_hit) / 2.0
-    center_dir = center_pos - agent_pos
-    center_dir_norm = center_dir / (jnp.linalg.norm(center_dir) + 1e-6)
-    cosine_center = jnp.where(
-        any_center_visible,
-        jnp.dot(agent_vel, center_dir_norm) / safe_vel_norm,
-        cosine_bearing,  # edges not visible: follow global bearing
-    )
+    # Edge B: non-target boundary most anti-parallel to A
+    dirs = boundary_hit_positions - agent_pos[None, :]                         # (n_rays, 2)
+    dirs_norm = dirs / (jnp.linalg.norm(dirs, axis=-1, keepdims=True) + 1e-6)
+    dot_with_a = dirs_norm @ dir_a_norm                                        # (n_rays,)
+    anti_score = jnp.where(is_non_target, dot_with_a, 1.0)
+    anti_score = anti_score.at[idx_a].set(1.0)  # exclude A itself
+
+    idx_b = jnp.argmin(anti_score)
+    hit_b = boundary_hit_positions[idx_b]
+    dist_b = dists[idx_b]
+
+    # Gate: both visible and B sufficiently anti-parallel
+    any_both_visible = (dist_a < sense_range) & (dist_b < sense_range) & (anti_score[idx_b] < -0.1)
+
+    # Road direction = perp(B − A), signed to agree with global bearing
+    cross = hit_b - hit_a
+    road_opt = jnp.array([-cross[1], cross[0]])
+    road_dir = jnp.where(jnp.dot(road_opt, bearing_vec) >= 0, road_opt, -road_opt)
+    road_dir_norm = road_dir / (jnp.linalg.norm(road_dir) + 1e-6)
+    cosine_road = jnp.dot(agent_vel, road_dir_norm) / safe_vel_norm
+
+    # Centering blend: pull toward A–B midpoint proportional to lateral offset
+    midpoint = (hit_a + hit_b) / 2.0
+    lateral_vec = midpoint - agent_pos
+    lateral_norm = lateral_vec / (jnp.linalg.norm(lateral_vec) + 1e-6)
+    cosine_lateral = jnp.dot(agent_vel, lateral_norm) / safe_vel_norm
+
+    strip_half_width = jnp.linalg.norm(cross) / 2.0 + 1e-6
+    offset = jnp.clip(jnp.linalg.norm(lateral_vec) / strip_half_width, 0.0, 1.0)
+
+    cosine_road_blended = (1.0 - 0.5 * offset) * cosine_road + 0.5 * offset * cosine_lateral
+    cosine_center = jnp.where(any_both_visible, cosine_road_blended, cosine_bearing)
 
     return jnp.where(in_target, cosine_center, cosine_entry)
 
@@ -177,7 +208,7 @@ class LidarTarget(LidarEnv):
     STAY_IN_CLUSTER_BONUS = 0.5          # continuous; effective = 0.05/step
     VELOCITY_PENALTY_IN_CLUSTER = -0.1   # soft nudge only — velocity not a priority in cluster
     TERRAIN_REWARD_COEFF = 0.0           # disabled: mid-range semantic lidar (set >0 to re-enable)
-    PREF_VECTOR_REWARD_COEFF = 0.0       # disabled: preference vector (set >0 to re-enable)
+    PREF_VECTOR_REWARD_COEFF = 0.2       # re-enabled: fixed for both configs; complements centering
     TERRAIN_PENALTY_COEFF = 0.5          # raised: road=-6.4/ep, 2.5x stronger than max bearing
     ROAD_SPEED_COEFF = 0.05              # mild bump — discourages fast road traversal
     GRASS_SPEED_COEFF = 0.1              # mild bump — discourages fast grass traversal
@@ -273,7 +304,7 @@ class LidarTarget(LidarEnv):
         velocity_penalty = jnp.where(is_in_next_cluster, velocity_magnitude_sq, 0.0).mean()
         reward += velocity_penalty * self.VELOCITY_PENALTY_IN_CLUSTER
 
-        reward -= (jnp.linalg.norm(action, axis=1) ** 2).mean() * 0.001
+        reward -= (jnp.linalg.norm(action, axis=1) ** 2).mean() * 0.01
 
         # ── Immediate terrain penalties (one-hot "haptic" feedback) ──────────
         # Road is strongly penalised; Grass is mildly penalised; Sidewalk is rewarded.
