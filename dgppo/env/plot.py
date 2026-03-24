@@ -254,34 +254,54 @@ def render_lidar(
     # Extract bridge parameters directly from the rollout's initial env state
     # These are the *actual* parameters used in the simulation for this rollout.
     # Convert JAX arrays to numpy scalars/arrays for Python/Matplotlib/Shapely compatibility
-    bridge_center_sim = np.array(first_env_state.bridge_center) if first_env_state.bridge_center is not None else np.array([0., 0.])
-    bridge_length_sim = float(first_env_state.bridge_length) if first_env_state.bridge_length is not None else 0.0
-    bridge_gap_width_sim = float(first_env_state.bridge_gap_width) if first_env_state.bridge_gap_width is not None else 0.0
+    bridge_center_sim        = np.array(first_env_state.bridge_center) if first_env_state.bridge_center is not None else np.array([0., 0.])
+    bridge_length_sim        = float(first_env_state.bridge_length) if first_env_state.bridge_length is not None else 0.0
+    bridge_gap_width_sim     = float(first_env_state.bridge_gap_width) if first_env_state.bridge_gap_width is not None else 0.0
     bridge_wall_thickness_sim = float(first_env_state.bridge_wall_thickness) if first_env_state.bridge_wall_thickness is not None else 0.0
-    bridge_theta_sim = float(first_env_state.bridge_theta) if first_env_state.bridge_theta is not None else 0.0 # radians
+    bridge_theta_sim         = float(first_env_state.bridge_theta) if first_env_state.bridge_theta is not None else 0.0  # radians
+    bridge_bend_angle_sim    = float(first_env_state.bridge_bend_angle) if hasattr(first_env_state, 'bridge_bend_angle') else 0.0
 
     bridges_for_associator = []
-    if bridge_length_sim > 0: # Only create if bridge exists
-        half_dist_to_wall_center = (bridge_gap_width_sim / 2) + (bridge_wall_thickness_sim / 2)
-        offset_x = -half_dist_to_wall_center * np.sin(bridge_theta_sim)
-        offset_y = half_dist_to_wall_center * np.cos(bridge_theta_sim)
+    if bridge_length_sim > 0:
+        # Build 4-wall layout matching create_bent_bridge:
+        #   walls 0/1 = segment-1 (left/right), walls 2/3 = segment-2 (left/right)
+        seg_len   = bridge_length_sim / 2.0
+        seg_q     = bridge_length_sim / 4.0
+        half_dist = (bridge_gap_width_sim / 2.0) + (bridge_wall_thickness_sim / 2.0)
 
-        # These are the *centers* of the two bridge walls, as determined by the environment
-        center1_wall = bridge_center_sim + np.array([offset_x, offset_y])
-        center2_wall = bridge_center_sim - np.array([offset_x, offset_y])
+        theta1 = bridge_theta_sim
+        theta2 = bridge_theta_sim + bridge_bend_angle_sim
+        cos1, sin1 = np.cos(theta1), np.sin(theta1)
+        cos2, sin2 = np.cos(theta2), np.sin(theta2)
 
-        wall_width = bridge_length_sim
-        wall_height = bridge_wall_thickness_sim
-        
-        bridge_theta_deg_sim = np.degrees(bridge_theta_sim) # BehaviorAssociator expects degrees
-        
-        # Pass the centers and dimensions to BehaviorAssociator
+        seg1_c = bridge_center_sim - seg_q * np.array([cos1, sin1])
+        seg2_c = bridge_center_sim + seg_q * np.array([cos2, sin2])
+
+        perp1 = np.array([-sin1, cos1]) * half_dist
+        perp2 = np.array([-sin2, cos2]) * half_dist
+
+        w0 = seg1_c + perp1;  w1 = seg1_c - perp1   # seg1 left, right
+        w2 = seg2_c + perp2;  w3 = seg2_c - perp2   # seg2 left, right
+
+        # Outer-arc extension (matches create_bent_bridge logic)
+        outer_half_dist = bridge_gap_width_sim / 2.0 + bridge_wall_thickness_sim
+        outer_ext = outer_half_dist * abs(np.sin(bridge_bend_angle_sim))
+        ccw = bridge_bend_angle_sim > 0   # CCW: outer=right (w1,w3); CW: outer=left (w0,w2)
+        seg1_step = (outer_ext / 2.0) * np.array([cos1, sin1])
+        seg2_step = (outer_ext / 2.0) * np.array([cos2, sin2])
+        if ccw:
+            w1 = w1 + seg1_step;  w3 = w3 - seg2_step
+            len0, len1, len2, len3 = seg_len, seg_len + outer_ext, seg_len, seg_len + outer_ext
+        else:
+            w0 = w0 + seg1_step;  w2 = w2 - seg2_step
+            len0, len1, len2, len3 = seg_len + outer_ext, seg_len, seg_len + outer_ext, seg_len
+
         bridges_for_associator = [
-            (float(center1_wall[0]), float(center1_wall[1]), wall_width, wall_height, bridge_theta_deg_sim),
-            (float(center2_wall[0]), float(center2_wall[1]), wall_width, wall_height, bridge_theta_deg_sim)
+            (float(w0[0]), float(w0[1]), len0, bridge_wall_thickness_sim, float(np.degrees(theta1))),
+            (float(w1[0]), float(w1[1]), len1, bridge_wall_thickness_sim, float(np.degrees(theta1))),
+            (float(w2[0]), float(w2[1]), len2, bridge_wall_thickness_sim, float(np.degrees(theta2))),
+            (float(w3[0]), float(w3[1]), len3, bridge_wall_thickness_sim, float(np.degrees(theta2))),
         ]
-    else:
-        bridges_for_associator = []
 
     obstacles_for_associator = []
     first_env_state = rollout.graph.env_states
@@ -330,6 +350,8 @@ def render_lidar(
                 bridge_theta=bridge_theta_sim,
                 side_length=side_length,
                 terrain_config=terrain_config_sim,
+                bridge_length=bridge_length_sim,
+                bridge_bend_angle=bridge_bend_angle_sim,
             )
         behavior_associator.visualize_behavior_regions(ax)  # draws cluster region patches + its own legend
         # Append terrain entries to the existing legend

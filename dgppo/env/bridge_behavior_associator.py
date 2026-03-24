@@ -268,33 +268,34 @@ def visualize_terrain(
     else:
         # ── Bent bridge: two longitudinally-clamped segments ─────────────
         seg_quarter = bridge_length / 4.0
-        seg_half    = bridge_length / 4.0
 
         # Segment 1
-        cos1, sin1  = np.cos(bridge_theta), np.sin(bridge_theta)
+        cos1, sin1 = np.cos(bridge_theta), np.sin(bridge_theta)
         seg1_cx = bridge_center[0] - seg_quarter * cos1
         seg1_cy = bridge_center[1] - seg_quarter * sin1
         dxs1 = XX - seg1_cx;  dys1 = YY - seg1_cy
         perp1 = np.abs(-sin1 * dxs1 + cos1 * dys1)
-        lon1  = np.abs( cos1 * dxs1 + sin1 * dys1)
-        in1   = lon1 <= seg_half * 1.1
 
         # Segment 2
         theta2 = bridge_theta + bridge_bend_angle
-        cos2, sin2  = np.cos(theta2), np.sin(theta2)
+        cos2, sin2 = np.cos(theta2), np.sin(theta2)
         seg2_cx = bridge_center[0] + seg_quarter * cos2
         seg2_cy = bridge_center[1] + seg_quarter * sin2
         dxs2 = XX - seg2_cx;  dys2 = YY - seg2_cy
         perp2 = np.abs(-sin2 * dxs2 + cos2 * dys2)
-        lon2  = np.abs( cos2 * dxs2 + sin2 * dys2)
-        in2   = lon2 <= seg_half * 1.1
 
         tid1 = _tid_from_perp(perp1)
         tid2 = _tid_from_perp(perp2)
 
-        prefer2     = in2 & (~in1 | (perp2 <= perp1))
-        terrain_grid = np.where(prefer2, tid2,
-                       np.where(in1,     tid1, 1))  # Grass outside both segments
+        # Split at the kink (bridge_center) using the bisector of the two segment directions.
+        # Entry side → seg1 terrain (extends beyond entry end);
+        # exit side → seg2 terrain (extends beyond exit end).
+        bisector_x = cos1 + cos2
+        bisector_y = sin1 + sin2
+        dp_kink_x = XX - bridge_center[0]
+        dp_kink_y = YY - bridge_center[1]
+        on_seg2_side = (dp_kink_x * bisector_x + dp_kink_y * bisector_y) >= 0
+        terrain_grid = np.where(on_seg2_side, tid2, tid1)
 
     # RGBA colour per terrain ID
     color_map = {

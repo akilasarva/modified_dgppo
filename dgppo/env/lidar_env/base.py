@@ -124,15 +124,12 @@ def get_terrain_id(
 
     # ── Bent-bridge terrain (two longitudinally-clamped segments) ────────────
     seg_quarter = bridge_length / 4.0   # distance from bridge_center to each segment center
-    seg_half    = bridge_length / 4.0   # longitudinal half-extent of each segment
 
     # Segment 1 (entry → bridge_center)
     seg1_dir = jnp.array([cos_t, sin_t])
     seg1_center = bridge_center - seg_quarter * seg1_dir
     dp1 = agent_pos - seg1_center
     perp1 = jnp.abs(-sin_t * dp1[0] + cos_t * dp1[1])
-    lon1  = jnp.abs( cos_t * dp1[0] + sin_t * dp1[1])
-    in_seg1 = lon1 <= seg_half * 1.1   # 10 % longitudinal overlap at junction
 
     # Segment 2 (bridge_center → exit)
     theta2 = bridge_theta + bridge_bend_angle
@@ -142,15 +139,17 @@ def get_terrain_id(
     seg2_center = bridge_center + seg_quarter * seg2_dir
     dp2 = agent_pos - seg2_center
     perp2 = jnp.abs(-sin_t2 * dp2[0] + cos_t2 * dp2[1])
-    lon2  = jnp.abs( cos_t2 * dp2[0] + sin_t2 * dp2[1])
-    in_seg2 = lon2 <= seg_half * 1.1
 
     tid1 = _terrain_from_perp(perp1, bridge_gap_width, bridge_wall_thickness, terrain_config)
     tid2 = _terrain_from_perp(perp2, bridge_gap_width, bridge_wall_thickness, terrain_config)
 
-    # At junction, prefer segment with smaller perp (agent deeper in that corridor)
-    prefer_seg2 = in_seg2 & ((~in_seg1) | (perp2 <= perp1))
-    tid_bent = jnp.where(prefer_seg2, tid2, jnp.where(in_seg1, tid1, 1))  # 1 = Grass
+    # Split plane at the kink (bridge_center) using the bisector of the two segment directions.
+    # Points on the entry side use seg1 terrain (extends beyond entry end);
+    # points on the exit side use seg2 terrain (extends beyond exit end).
+    bisector = seg1_dir + seg2_dir   # proportional to the angular bisector
+    dp_kink = agent_pos - bridge_center
+    on_seg2_side = jnp.dot(dp_kink, bisector) >= 0
+    tid_bent = jnp.where(on_seg2_side, tid2, tid1)
 
     return jnp.where(jnp.abs(bridge_bend_angle) < 1e-6, tid_straight, tid_bent)
 
@@ -324,10 +323,34 @@ def create_bent_bridge(
     wall2_center = seg2_center + perp2              # left wall
     wall3_center = seg2_center - perp2              # right wall
 
-    obs_pos   = jnp.stack([wall0_center, wall1_center, wall2_center, wall3_center])  # (4, 2)
-    obs_len_x = jnp.array([seg_len, seg_len, seg_len, seg_len])                       # (4,)
-    obs_len_y = jnp.full((4,), bridge_wall_thickness)                                 # (4,)
-    obs_theta = jnp.array([bridge_theta, bridge_theta, theta2, theta2])               # (4,)
+    # ── Outer-arc extension: close the gap at the outer kink corner ───────
+    # The outer wall pair (right for CCW bend, left for CW) doesn't meet at
+    # the kink.  Extend each outer wall past bridge_center by exactly the
+    # longitudinal projection of the gap onto that segment's axis.
+    outer_half_dist = bridge_gap_width / 2.0 + bridge_wall_thickness
+    outer_ext = outer_half_dist * jnp.abs(jnp.sin(bridge_bend_angle))
+    zero2 = jnp.zeros(2)
+    ccw   = bridge_bend_angle > 0   # CCW: outer=right (wall1,wall3); CW: outer=left (wall0,wall2)
+
+    # Shift each outer seg-1 wall center toward the kink (+seg1_dir) by half the extension
+    seg1_step = (outer_ext / 2.0) * jnp.array([cos1, sin1])
+    wall0_center = wall0_center + jnp.where(~ccw, seg1_step, zero2)   # left  extends when CW
+    wall1_center = wall1_center + jnp.where( ccw, seg1_step, zero2)   # right extends when CCW
+
+    # Shift each outer seg-2 wall center back toward the kink (-seg2_dir) by half the extension
+    seg2_step = (outer_ext / 2.0) * jnp.array([cos2, sin2])
+    wall2_center = wall2_center - jnp.where(~ccw, seg2_step, zero2)
+    wall3_center = wall3_center - jnp.where( ccw, seg2_step, zero2)
+
+    ext0 = jnp.where(~ccw, outer_ext, 0.0)
+    ext1 = jnp.where( ccw, outer_ext, 0.0)
+    ext2 = jnp.where(~ccw, outer_ext, 0.0)
+    ext3 = jnp.where( ccw, outer_ext, 0.0)
+
+    obs_pos   = jnp.stack([wall0_center, wall1_center, wall2_center, wall3_center])       # (4, 2)
+    obs_len_x = jnp.array([seg_len + ext0, seg_len + ext1, seg_len + ext2, seg_len + ext3])  # (4,)
+    obs_len_y = jnp.full((4,), bridge_wall_thickness)                                         # (4,)
+    obs_theta = jnp.array([bridge_theta, bridge_theta, theta2, theta2])                       # (4,)
 
     return obs_pos, obs_len_x, obs_len_y, obs_theta
 
