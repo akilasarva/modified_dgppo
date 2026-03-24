@@ -43,7 +43,8 @@ class LidarEnvState(NamedTuple):
     bridge_length: float
     bridge_gap_width: float
     bridge_wall_thickness: float
-    bridge_theta: float # Stored in radians
+    bridge_theta: float         # Stored in radians; angle of segment 1 (entry segment)
+    bridge_bend_angle: float    # Angular offset of segment 2 relative to segment 1 (0 = straight)
     terrain_config: jnp.ndarray  # scalar int: 1 or 2, sampled randomly per episode
 
     @property
@@ -69,62 +70,103 @@ TERRAIN_CONFIG = 1  # Switch between 1 and 2 here
 TARGET_TERRAIN_ID = 2  # Sidewalk
 
 
-def get_terrain_id(
-    agent_pos: jnp.ndarray,             # (2,)
-    bridge_center: jnp.ndarray,          # (2,)
-    bridge_gap_width: jnp.ndarray,       # scalar
-    bridge_wall_thickness: jnp.ndarray,  # scalar
-    bridge_theta: jnp.ndarray,           # scalar, radians
-    terrain_config: jnp.ndarray,         # scalar int: 1 or 2
+def _terrain_from_perp(
+    perp: jnp.ndarray,               # scalar, absolute perpendicular distance from corridor axis
+    bridge_gap_width: jnp.ndarray,
+    bridge_wall_thickness: jnp.ndarray,
+    terrain_config: jnp.ndarray,
 ) -> jnp.ndarray:
-    """
-    Geometry-based terrain detection using bridge-local perpendicular distance.
-    The strip extends the full frame (no cutoff along the bridge axis).
-
-    terrain_config = 1
-      Sidewalk : |perp| <= half_gap + wall_thickness  (entire bridge-width band)
-      Grass    : everything else
-
-    terrain_config = 2
-      Road     : |perp| <= half_gap - sidewalk_border  (centre of the open gap)
-      Sidewalk : half_gap - sidewalk_border < |perp| <= half_gap  (1/5 of gap per side)
-      Grass    : |perp| > half_gap  (outside the gap entirely)
-    """
-    dx = agent_pos[0] - bridge_center[0]
-    dy = agent_pos[1] - bridge_center[1]
-
-    cos_t = jnp.cos(bridge_theta)
-    sin_t = jnp.sin(bridge_theta)
-
-    # Perpendicular distance into bridge-local frame
-    perp = jnp.abs(-sin_t * dx + cos_t * dy)
-
+    """Terrain ID from absolute perpendicular distance to a corridor centerline."""
     half_gap  = bridge_gap_width / 2.0
-    full_half = half_gap + bridge_wall_thickness  # outer edge of walls
-
-    # Config 1: entire diagonal band = Sidewalk(2), rest = Grass(1)
-    terrain_id_config1 = jnp.where(perp <= full_half, 2, 1)
-
-    # Config 2: Road(0) | Sidewalk(2) | Grass(1)
-    sidewalk_border = bridge_gap_width * 0.2  # 1/5 of gap width per side
+    full_half = half_gap + bridge_wall_thickness
+    sidewalk_border = bridge_gap_width * 0.2
     road_half = half_gap - sidewalk_border
     is_road     = perp <= road_half
     is_sidewalk = (perp > road_half) & (perp <= half_gap)
-    terrain_id_config2 = jnp.where(is_road, 0, jnp.where(is_sidewalk, 2, 1))
+    tid_c1 = jnp.where(perp <= full_half, 2, 1)
+    tid_c2 = jnp.where(is_road, 0, jnp.where(is_sidewalk, 2, 1))
+    return jnp.where(terrain_config == 1, tid_c1, tid_c2)
 
-    return jnp.where(terrain_config == 1, terrain_id_config1, terrain_id_config2)
+
+def get_terrain_id(
+    agent_pos: jnp.ndarray,             # (2,)
+    bridge_center: jnp.ndarray,          # (2,) — bend/junction point for bent bridge
+    bridge_gap_width: jnp.ndarray,       # scalar
+    bridge_wall_thickness: jnp.ndarray,  # scalar
+    bridge_theta: jnp.ndarray,           # scalar, radians — angle of segment 1 (entry)
+    terrain_config: jnp.ndarray,         # scalar int: 1 or 2
+    bridge_length: jnp.ndarray = 1.0,   # total bridge length (each segment = half)
+    bridge_bend_angle: jnp.ndarray = 0.0,  # angular offset of segment 2 (0 = straight)
+) -> jnp.ndarray:
+    """
+    Geometry-based terrain detection.
+
+    Straight bridge (bridge_bend_angle == 0):
+      Uses infinite perpendicular strip from bridge_center (original behaviour).
+
+    Bent bridge (bridge_bend_angle != 0):
+      Two segments meeting at bridge_center (the bend point).
+        Segment 1: entry → bridge_center, direction bridge_theta
+        Segment 2: bridge_center → exit, direction bridge_theta + bridge_bend_angle
+      Longitudinally clamped per segment (10 % overlap at junction).
+      Terrain = segment with smaller perp distance when in both; Grass if in neither.
+
+    terrain_config = 1 : full band = Sidewalk
+    terrain_config = 2 : Road | Sidewalk | Grass
+    """
+    # ── Straight-bridge terrain (original infinite-strip logic) ──────────────
+    dx_s = agent_pos[0] - bridge_center[0]
+    dy_s = agent_pos[1] - bridge_center[1]
+    cos_t = jnp.cos(bridge_theta)
+    sin_t = jnp.sin(bridge_theta)
+    perp_straight = jnp.abs(-sin_t * dx_s + cos_t * dy_s)
+    tid_straight = _terrain_from_perp(perp_straight, bridge_gap_width, bridge_wall_thickness, terrain_config)
+
+    # ── Bent-bridge terrain (two longitudinally-clamped segments) ────────────
+    seg_quarter = bridge_length / 4.0   # distance from bridge_center to each segment center
+    seg_half    = bridge_length / 4.0   # longitudinal half-extent of each segment
+
+    # Segment 1 (entry → bridge_center)
+    seg1_dir = jnp.array([cos_t, sin_t])
+    seg1_center = bridge_center - seg_quarter * seg1_dir
+    dp1 = agent_pos - seg1_center
+    perp1 = jnp.abs(-sin_t * dp1[0] + cos_t * dp1[1])
+    lon1  = jnp.abs( cos_t * dp1[0] + sin_t * dp1[1])
+    in_seg1 = lon1 <= seg_half * 1.1   # 10 % longitudinal overlap at junction
+
+    # Segment 2 (bridge_center → exit)
+    theta2 = bridge_theta + bridge_bend_angle
+    cos_t2 = jnp.cos(theta2)
+    sin_t2 = jnp.sin(theta2)
+    seg2_dir = jnp.array([cos_t2, sin_t2])
+    seg2_center = bridge_center + seg_quarter * seg2_dir
+    dp2 = agent_pos - seg2_center
+    perp2 = jnp.abs(-sin_t2 * dp2[0] + cos_t2 * dp2[1])
+    lon2  = jnp.abs( cos_t2 * dp2[0] + sin_t2 * dp2[1])
+    in_seg2 = lon2 <= seg_half * 1.1
+
+    tid1 = _terrain_from_perp(perp1, bridge_gap_width, bridge_wall_thickness, terrain_config)
+    tid2 = _terrain_from_perp(perp2, bridge_gap_width, bridge_wall_thickness, terrain_config)
+
+    # At junction, prefer segment with smaller perp (agent deeper in that corridor)
+    prefer_seg2 = in_seg2 & ((~in_seg1) | (perp2 <= perp1))
+    tid_bent = jnp.where(prefer_seg2, tid2, jnp.where(in_seg1, tid1, 1))  # 1 = Grass
+
+    return jnp.where(jnp.abs(bridge_bend_angle) < 1e-6, tid_straight, tid_bent)
 
 
 def _get_semantic_lidar_single(
     agent_pos: jnp.ndarray,              # (2,)
     obstacles,                           # Obstacle (stacked)
-    bridge_center: jnp.ndarray,          # (2,)
+    bridge_center: jnp.ndarray,          # (2,) — bend/junction point
     bridge_gap_width: jnp.ndarray,
     bridge_wall_thickness: jnp.ndarray,
-    bridge_theta: jnp.ndarray,
+    bridge_theta: jnp.ndarray,           # segment-1 angle (radians)
     terrain_config: jnp.ndarray,
     num_beams: int,
     sense_range: float,
+    bridge_length: jnp.ndarray = 1.0,   # total bridge length
+    bridge_bend_angle: jnp.ndarray = 0.0,  # segment-2 offset angle (0 = straight)
 ) -> Tuple[jnp.ndarray, jnp.ndarray]:
     """
     Per-ray semantic lidar for one agent.
@@ -132,11 +174,10 @@ def _get_semantic_lidar_single(
     For each of the B rays, returns TWO hit points (2B total):
       [0 : B]  — obstacle hit (or sensor-range endpoint if no obstacle)
       [B : 2B] — nearest boundary of TARGET_TERRAIN_ID zone along that ray
-                 (or sensor-range endpoint if no boundary within range)
 
-    This means:
-      - if agent is IN target terrain  → boundary hit = exit edge  (stay away)
-      - if agent is NOT in target terrain → boundary hit = entry edge (approach it)
+    For a bent bridge the terrain boundaries from BOTH segments are considered;
+    the nearest valid one is returned.  For a straight bridge (bend_angle=0)
+    both segments are collinear so the result is identical to the original.
 
     Returns:
         hit_points:  (2*num_beams, 2)   positions in world frame
@@ -150,36 +191,48 @@ def _get_semantic_lidar_single(
     # ── Obstacle hit alphas (one per ray) ──────────────────────────────────
     alphas_obs = get_ray_alphas(starts, ends, obstacles)               # (B,)
 
-    # ── Nearest TARGET-terrain boundary alpha (one per ray) ────────────────
-    cos_bt = jnp.cos(bridge_theta)
-    sin_bt = jnp.sin(bridge_theta)
-    dx0    = agent_pos[0] - bridge_center[0]
-    dy0    = agent_pos[1] - bridge_center[1]
-    perp_start = -sin_bt * dx0 + cos_bt * dy0                         # scalar
-    perp_dirs  = -sin_bt * dirs[:, 0] + cos_bt * dirs[:, 1]           # (B,)
-
+    # ── Terrain boundary alphas: 4 borders per segment, 8 total ────────────
     half_gap        = bridge_gap_width / 2.0
     full_half       = half_gap + bridge_wall_thickness
     sidewalk_border = bridge_gap_width * 0.2
     road_half       = half_gap - sidewalk_border
 
-    # Borders of TARGET_TERRAIN_ID zone (Sidewalk = ±road_half, ±half_gap for config2;
-    # ±full_half for config1).  Both configs share the same slot count (4).
-    # Config 1: Sidewalk occupies |perp| ≤ full_half  →  borders at ±full_half
-    # Config 2: Sidewalk occupies road_half < |perp| ≤ half_gap  →  borders at ±road_half, ±half_gap
-    target_borders_c1 = jnp.array([ full_half, -full_half,  full_half, -full_half])
-    target_borders_c2 = jnp.array([ road_half, -road_half,  half_gap,  -half_gap])
-    target_borders = jnp.where(terrain_config == 1, target_borders_c1, target_borders_c2)  # (4,)
+    # Sidewalk zone borders in perpendicular coords (shared by both segments).
+    # Config 1: ±full_half (repeated). Config 2: ±road_half and ±half_gap.
+    borders_c1 = jnp.array([ full_half, -full_half,  full_half, -full_half])
+    borders_c2 = jnp.array([ road_half, -road_half,  half_gap,  -half_gap])
+    seg_borders = jnp.where(terrain_config == 1, borders_c1, borders_c2)  # (4,)
 
-    eps      = 1e-8
-    safe_pd  = jnp.where(jnp.abs(perp_dirs) > eps, perp_dirs, eps)
-    alphas_b = (target_borders[None, :] - perp_start) / (safe_pd[:, None] * sense_range)  # (B, 4)
-    valid    = (alphas_b > 1e-4) & (alphas_b < 1.0) & (jnp.abs(perp_dirs[:, None]) > eps)
-    alphas_b = jnp.where(valid, alphas_b, 2.0)
-    alphas_terrain = alphas_b.min(axis=-1)                             # (B,) nearest target border
+    eps = 1e-8
+
+    def _seg_alphas(seg_center, seg_theta):
+        """Compute (B, 4) validated alphas for one corridor segment."""
+        cos_s = jnp.cos(seg_theta)
+        sin_s = jnp.sin(seg_theta)
+        dx0   = agent_pos[0] - seg_center[0]
+        dy0   = agent_pos[1] - seg_center[1]
+        perp_start = -sin_s * dx0 + cos_s * dy0               # scalar
+        perp_dirs  = -sin_s * dirs[:, 0] + cos_s * dirs[:, 1] # (B,)
+        safe_pd    = jnp.where(jnp.abs(perp_dirs) > eps, perp_dirs, eps)
+        alphas = (seg_borders[None, :] - perp_start) / (safe_pd[:, None] * sense_range)  # (B, 4)
+        valid  = (alphas > 1e-4) & (alphas < 1.0) & (jnp.abs(perp_dirs[:, None]) > eps)
+        return jnp.where(valid, alphas, 2.0)                   # (B, 4)
+
+    # Segment 1 center: bridge_center displaced backward along seg-1 axis by seg_quarter
+    seg_quarter = bridge_length / 4.0
+    seg1_center = bridge_center - seg_quarter * jnp.array([jnp.cos(bridge_theta), jnp.sin(bridge_theta)])
+    alphas_seg1 = _seg_alphas(seg1_center, bridge_theta)       # (B, 4)
+
+    # Segment 2 center: bridge_center displaced forward along seg-2 axis by seg_quarter
+    theta2      = bridge_theta + bridge_bend_angle
+    seg2_center = bridge_center + seg_quarter * jnp.array([jnp.cos(theta2), jnp.sin(theta2)])
+    alphas_seg2 = _seg_alphas(seg2_center, theta2)             # (B, 4)
+
+    # Combine: nearest valid boundary across both segments
+    alphas_all     = jnp.concatenate([alphas_seg1, alphas_seg2], axis=-1)  # (B, 8)
+    alphas_terrain = alphas_all.min(axis=-1)                               # (B,)
 
     # ── Build hit points ────────────────────────────────────────────────────
-    # First B: obstacle hits; last B: terrain boundary hits (same ray order)
     obs_hits      = agent_pos[None, :] + alphas_obs[:, None]     * sense_range * dirs  # (B, 2)
     boundary_hits = agent_pos[None, :] + alphas_terrain[:, None] * sense_range * dirs  # (B, 2)
     hit_points    = jnp.concatenate([obs_hits, boundary_hits])                          # (2B, 2)
@@ -191,19 +244,18 @@ def _get_semantic_lidar_single(
         bridge_wall_thickness=bridge_wall_thickness,
         bridge_theta=bridge_theta,
         terrain_config=terrain_config,
+        bridge_length=bridge_length,
+        bridge_bend_angle=bridge_bend_angle,
     )
 
     # ── Terrain IDs ─────────────────────────────────────────────────────────
-    # Obstacle hits: terrain AT the hit position (what ground the obstacle sits on)
-    obs_terrain_ids = jax_vmap(_get_tid)(obs_hits)                     # (B,)
+    obs_terrain_ids = jax_vmap(_get_tid)(obs_hits)                         # (B,)
 
-    # Boundary hits: terrain on the OTHER SIDE of the boundary (what you'd enter)
-    # Step a small epsilon past the hit in the ray direction before sampling terrain
-    BOUNDARY_STEP = 0.005  # metres past the boundary line (must be << sidewalk width ~0.04–0.08 m)
-    boundary_beyond = boundary_hits + BOUNDARY_STEP * dirs             # (B, 2)
-    boundary_terrain_ids = jax_vmap(_get_tid)(boundary_beyond)         # (B,)
+    BOUNDARY_STEP = 0.005
+    boundary_beyond      = boundary_hits + BOUNDARY_STEP * dirs            # (B, 2)
+    boundary_terrain_ids = jax_vmap(_get_tid)(boundary_beyond)             # (B,)
 
-    terrain_ids = jnp.concatenate([obs_terrain_ids, boundary_terrain_ids])  # (2B,)
+    terrain_ids = jnp.concatenate([obs_terrain_ids, boundary_terrain_ids]) # (2B,)
 
     return hit_points, terrain_ids
 
@@ -231,33 +283,51 @@ def _topk_hits_per_agent(
     )
 
 
-def create_single_bridge(
-    bridge_center: jnp.ndarray, # (2,) for x, y
-    bridge_length: float,
+def create_bent_bridge(
+    bridge_center: jnp.ndarray,  # (2,) — bend/junction point
+    bridge_length: float,        # total length; each segment = bridge_length/2
     bridge_gap_width: float,
     bridge_wall_thickness: float,
-    bridge_theta: float # In radians
+    bridge_theta: float,         # segment-1 angle, radians
+    bridge_bend_angle: float,    # segment-2 offset from segment-1 (0 = straight)
 ) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    """
+    Create 4 rectangular obstacles for a (possibly bent) bridge.
 
-    # Calculate half of the total bridge width
-    half_dist_to_wall_center = (bridge_gap_width / 2) + (bridge_wall_thickness / 2)
+    Wall layout (indices in returned arrays):
+      0 — segment-1, left  wall  (+perp side)
+      1 — segment-1, right wall  (-perp side)
+      2 — segment-2, left  wall  (+perp side)
+      3 — segment-2, right wall  (-perp side)
 
-    offset_x = -half_dist_to_wall_center * jnp.sin(bridge_theta)
-    offset_y = half_dist_to_wall_center * jnp.cos(bridge_theta)
+    For bridge_bend_angle == 0 the two segments are collinear and the result
+    is a straight bridge split into two equal halves (backward-compatible
+    with geometry-based collision / lidar, though the obstacle count is 4
+    instead of 2 compared to the old create_single_bridge).
+    """
+    seg_len     = bridge_length / 2.0        # each segment's length
+    seg_quarter = bridge_length / 4.0        # bridge_center → segment center offset
+    half_dist   = (bridge_gap_width / 2.0) + (bridge_wall_thickness / 2.0)
 
-    # Calculate centers for the two bridge walls
-    center1 = bridge_center + jnp.array([offset_x, offset_y])
-    center2 = bridge_center - jnp.array([offset_x, offset_y])
+    # ── Segment 1 (entry → bridge_center) ────────────────────────────────
+    cos1, sin1 = jnp.cos(bridge_theta), jnp.sin(bridge_theta)
+    seg1_center = bridge_center - seg_quarter * jnp.array([cos1, sin1])
+    perp1 = jnp.array([-sin1, cos1]) * half_dist   # perpendicular offset
+    wall0_center = seg1_center + perp1              # left wall
+    wall1_center = seg1_center - perp1              # right wall
 
-    # Each wall has the same length, thickness, and orientation as the bridge
-    wall_width = bridge_length # The 'width' of the rectangle is the bridge 'length'
-    wall_height = bridge_wall_thickness # The 'height' of the rectangle is the wall 'thickness'
+    # ── Segment 2 (bridge_center → exit) ─────────────────────────────────
+    theta2 = bridge_theta + bridge_bend_angle
+    cos2, sin2 = jnp.cos(theta2), jnp.sin(theta2)
+    seg2_center = bridge_center + seg_quarter * jnp.array([cos2, sin2])
+    perp2 = jnp.array([-sin2, cos2]) * half_dist
+    wall2_center = seg2_center + perp2              # left wall
+    wall3_center = seg2_center - perp2              # right wall
 
-    # Combine parameters for the two rectangles
-    obs_pos = jnp.stack([center1, center2]) # Shape (2, 2)
-    obs_len_x = jnp.array([wall_width, wall_width]) # Shape (2,)
-    obs_len_y = jnp.array([wall_height, wall_height]) # Shape (2,)
-    obs_theta = jnp.array([bridge_theta, bridge_theta]) # Shape (2,)
+    obs_pos   = jnp.stack([wall0_center, wall1_center, wall2_center, wall3_center])  # (4, 2)
+    obs_len_x = jnp.array([seg_len, seg_len, seg_len, seg_len])                       # (4,)
+    obs_len_y = jnp.full((4,), bridge_wall_thickness)                                 # (4,)
+    obs_theta = jnp.array([bridge_theta, bridge_theta, theta2, theta2])               # (4,)
 
     return obs_pos, obs_len_x, obs_len_y, obs_theta
 
@@ -430,6 +500,7 @@ class LidarEnv(MultiAgentEnv, ABC):
         bridge_gap_width_env_state: Float[Array, ""] = jnp.array(0.0)
         bridge_wall_thickness_env_state: Float[Array, ""] = jnp.array(0.0)
         bridge_theta_env_state: Float[Array, ""] = jnp.array(0.0)
+        bridge_bend_angle_env_state: Float[Array, ""] = jnp.array(0.0)
         terrain_config_env_state: jnp.ndarray = jnp.array(1, dtype=jnp.int32)
         initial_bonus_awarded = jnp.zeros(self.num_agents, dtype=jnp.bool_)
 
@@ -480,7 +551,7 @@ class LidarEnv(MultiAgentEnv, ABC):
                     print("Warning: Only 1 bridge is currently supported for direct parameter storage.")
 
                 bridge_rand_key, key = jr.split(key)
-                center_key, length_key, gap_key, thickness_key, theta_key, config_key = jr.split(bridge_rand_key, 6)
+                center_key, length_key, gap_key, thickness_key, theta_key, config_key, bend_key = jr.split(bridge_rand_key, 7)
 
                 bridge_length = jr.uniform(length_key, (),
                                             minval=self._params.get("bridge_length_range", (0.5, 1.0))[0],
@@ -493,6 +564,10 @@ class LidarEnv(MultiAgentEnv, ABC):
                                                     maxval=self._params.get("bridge_wall_thickness_range", (0.03, 0.1))[1])
                 bridge_theta = jr.uniform(theta_key, (), minval=0, maxval=2 * jnp.pi)
                 terrain_config_episode = jr.randint(config_key, (), minval=1, maxval=3)  # 1 or 2
+                _bend_range = self._params.get("bridge_bend_angle_range", (0.0, 0.0))
+                bridge_bend_angle = jr.uniform(bend_key, (),
+                                               minval=_bend_range[0],
+                                               maxval=_bend_range[1])
 
                 effective_len = bridge_length
                 effective_width = bridge_gap_width + 2 * bridge_wall_thickness
@@ -524,12 +599,13 @@ class LidarEnv(MultiAgentEnv, ABC):
                 # bridge_theta = 0
 
                 bridge_obs_pos, bridge_obs_len_x, bridge_obs_len_y, bridge_obs_theta = \
-                    create_single_bridge(
+                    create_bent_bridge(
                         bridge_center,
                         bridge_length,
                         bridge_gap_width,
                         bridge_wall_thickness,
-                        bridge_theta
+                        bridge_theta,
+                        bridge_bend_angle,
                     )
                 
                 all_obs_pos_list.append(bridge_obs_pos)
@@ -542,6 +618,7 @@ class LidarEnv(MultiAgentEnv, ABC):
                 bridge_gap_width_env_state = bridge_gap_width
                 bridge_wall_thickness_env_state = bridge_wall_thickness
                 bridge_theta_env_state = bridge_theta
+                bridge_bend_angle_env_state = bridge_bend_angle
                 terrain_config_env_state = terrain_config_episode
 
         if all_obs_pos_list:
@@ -560,21 +637,27 @@ class LidarEnv(MultiAgentEnv, ABC):
 
         if num_bridges > 0:
 
-            half_dist_to_wall_center = (bridge_gap_width_env_state / 2) + (bridge_wall_thickness_env_state / 2)
-            offset_x = -half_dist_to_wall_center * jnp.sin(bridge_theta_env_state)
-            offset_y = half_dist_to_wall_center * jnp.cos(bridge_theta_env_state)
-
-            center1 = bridge_center_env_state + jnp.array([offset_x, offset_y])
-            center2 = bridge_center_env_state - jnp.array([offset_x, offset_y])
-
-            wall_width = bridge_length_env_state
-            wall_height = bridge_wall_thickness_env_state
-
-            bridge_theta_deg = jnp.degrees(bridge_theta_env_state)
+            # Build 4-wall params for BehaviorBridge (matches create_bent_bridge layout).
+            # Wall 0/1 = segment-1 (left/right), Wall 2/3 = segment-2 (left/right).
+            _half_dist = (bridge_gap_width_env_state / 2.0) + (bridge_wall_thickness_env_state / 2.0)
+            _seg_len   = bridge_length_env_state / 2.0
+            _seg_q     = bridge_length_env_state / 4.0
+            _theta1    = bridge_theta_env_state
+            _theta2    = bridge_theta_env_state + bridge_bend_angle_env_state
+            _cos1, _sin1 = jnp.cos(_theta1), jnp.sin(_theta1)
+            _cos2, _sin2 = jnp.cos(_theta2), jnp.sin(_theta2)
+            _seg1_c = bridge_center_env_state - _seg_q * jnp.array([_cos1, _sin1])
+            _seg2_c = bridge_center_env_state + _seg_q * jnp.array([_cos2, _sin2])
+            _perp1  = jnp.array([-_sin1, _cos1]) * _half_dist
+            _perp2  = jnp.array([-_sin2, _cos2]) * _half_dist
+            _w0 = _seg1_c + _perp1;  _w1 = _seg1_c - _perp1
+            _w2 = _seg2_c + _perp2;  _w3 = _seg2_c - _perp2
 
             bridges_for_associator = [
-                (center1[0], center1[1], wall_width, wall_height, bridge_theta_deg),
-                (center2[0], center2[1], wall_width, wall_height, bridge_theta_deg)
+                (_w0[0], _w0[1], _seg_len, bridge_wall_thickness_env_state, jnp.degrees(_theta1)),
+                (_w1[0], _w1[1], _seg_len, bridge_wall_thickness_env_state, jnp.degrees(_theta1)),
+                (_w2[0], _w2[1], _seg_len, bridge_wall_thickness_env_state, jnp.degrees(_theta2)),
+                (_w3[0], _w3[1], _seg_len, bridge_wall_thickness_env_state, jnp.degrees(_theta2)),
             ]
 
             associator = BehaviorBridge(
@@ -593,13 +676,15 @@ class LidarEnv(MultiAgentEnv, ABC):
             exit_bridge_id = self.CLUSTER_MAP["exit_bridge_0"]
             
             bridge_dir_vec = jnp.array([jnp.cos(bridge_theta_env_state), jnp.sin(bridge_theta_env_state)])
-            
+            theta2_env = bridge_theta_env_state + bridge_bend_angle_env_state
+            seg2_dir_vec = jnp.array([jnp.cos(theta2_env), jnp.sin(theta2_env)])
+
             bridge_end1 = bridge_center_env_state - (bridge_length_env_state / 2) * bridge_dir_vec
-            bridge_end2 = bridge_center_env_state + (bridge_length_env_state / 2) * bridge_dir_vec
+            bridge_end2 = bridge_center_env_state + (bridge_length_env_state / 2) * seg2_dir_vec
             
             exit_bridge_centroid = associator.get_region_centroid(exit_bridge_id)
             
-            exit_direction_vector = jnp.array([jnp.cos(bridge_theta_env_state), jnp.sin(bridge_theta_env_state)])
+            exit_direction_vector = seg2_dir_vec
             
             open_space_goal_distance = 0.4 #self.params["open_space_goal_distance"]
             
@@ -683,6 +768,8 @@ class LidarEnv(MultiAgentEnv, ABC):
                     bridge_wall_thickness=bridge_wall_thickness_env_state,
                     bridge_theta=bridge_theta_env_state,
                     terrain_config=terrain_config_env_state,
+                    bridge_length=bridge_length_env_state,
+                    bridge_bend_angle=bridge_bend_angle_env_state,
                 )
             )(states[:, :2])  # (n_agents,)
             initial_terrain_oh = jax.nn.one_hot(initial_terrain_ids, self.terrain_oh_dim)  # (n_agents, 3)
@@ -714,6 +801,8 @@ class LidarEnv(MultiAgentEnv, ABC):
             bridge_center_env_state, bridge_gap_width_env_state,
             bridge_wall_thickness_env_state, bridge_theta_env_state,
             terrain_config_env_state,
+            bridge_length=bridge_length_env_state,
+            bridge_bend_angle=bridge_bend_angle_env_state,
         )
         n_full = self.num_agents * 2 * self._params["n_rays"]
         if lidar_data is not None:
@@ -740,6 +829,7 @@ class LidarEnv(MultiAgentEnv, ABC):
             bridge_gap_width=bridge_gap_width_env_state,
             bridge_wall_thickness=bridge_wall_thickness_env_state,
             bridge_theta=bridge_theta_env_state,
+            bridge_bend_angle=bridge_bend_angle_env_state,
             terrain_config=terrain_config_env_state,
         )
 
@@ -786,6 +876,8 @@ class LidarEnv(MultiAgentEnv, ABC):
         bridge_wall_thickness: jnp.ndarray,
         bridge_theta: jnp.ndarray,
         terrain_config: jnp.ndarray,
+        bridge_length: jnp.ndarray = 1.0,
+        bridge_bend_angle: jnp.ndarray = 0.0,
     ) -> Tuple[jnp.ndarray, jnp.ndarray]:
         """
         Per-ray semantic lidar.
@@ -805,6 +897,8 @@ class LidarEnv(MultiAgentEnv, ABC):
                 terrain_config=terrain_config,
                 num_beams=self._params["n_rays"],
                 sense_range=self._params["comm_radius"],
+                bridge_length=bridge_length,
+                bridge_bend_angle=bridge_bend_angle,
             )
         )(states[:, :2])
         return lidar_data, terrain_ids  # (n_agents, 2*n_rays, 2), (n_agents, 2*n_rays)
@@ -831,28 +925,32 @@ class LidarEnv(MultiAgentEnv, ABC):
         bridge_gap_width = graph.env_states.bridge_gap_width
         bridge_wall_thickness = graph.env_states.bridge_wall_thickness
         bridge_theta = graph.env_states.bridge_theta
+        bridge_bend_angle = graph.env_states.bridge_bend_angle
         terrain_config = graph.env_states.terrain_config
-        
+
         cos_theta = jnp.cos(bridge_theta)
         sin_theta = jnp.sin(bridge_theta)
 
-        half_gap_plus_half_wall = (bridge_gap_width / 2.0) + (bridge_wall_thickness / 2.0)
-
-        offset_x_perp = -sin_theta * half_gap_plus_half_wall
-        offset_y_perp = cos_theta * half_gap_plus_half_wall
-
-        offset_vector = jnp.array([offset_x_perp, offset_y_perp])
-
-        wall1_center = bridge_center + offset_vector
-        wall2_center = bridge_center - offset_vector
-        
-        wall_length = bridge_length
-        wall_width = bridge_wall_thickness
-        wall_angle_deg = jnp.degrees(bridge_theta) 
+        # Rebuild 4-wall params matching create_bent_bridge layout.
+        _half_dist_s = (bridge_gap_width / 2.0) + (bridge_wall_thickness / 2.0)
+        _seg_len_s   = bridge_length / 2.0
+        _seg_q_s     = bridge_length / 4.0
+        _theta1_s    = bridge_theta
+        _theta2_s    = bridge_theta + bridge_bend_angle
+        _cos1_s, _sin1_s = jnp.cos(_theta1_s), jnp.sin(_theta1_s)
+        _cos2_s, _sin2_s = jnp.cos(_theta2_s), jnp.sin(_theta2_s)
+        _seg1_cs = bridge_center - _seg_q_s * jnp.array([_cos1_s, _sin1_s])
+        _seg2_cs = bridge_center + _seg_q_s * jnp.array([_cos2_s, _sin2_s])
+        _perp1_s = jnp.array([-_sin1_s, _cos1_s]) * _half_dist_s
+        _perp2_s = jnp.array([-_sin2_s, _cos2_s]) * _half_dist_s
+        _sw0 = _seg1_cs + _perp1_s;  _sw1 = _seg1_cs - _perp1_s
+        _sw2 = _seg2_cs + _perp2_s;  _sw3 = _seg2_cs - _perp2_s
 
         bridge_walls_params = [
-            (wall1_center[0], wall1_center[1], wall_length, wall_width, wall_angle_deg),
-            (wall2_center[0], wall2_center[1], wall_length, wall_width, wall_angle_deg)
+            (_sw0[0], _sw0[1], _seg_len_s, bridge_wall_thickness, jnp.degrees(_theta1_s)),
+            (_sw1[0], _sw1[1], _seg_len_s, bridge_wall_thickness, jnp.degrees(_theta1_s)),
+            (_sw2[0], _sw2[1], _seg_len_s, bridge_wall_thickness, jnp.degrees(_theta2_s)),
+            (_sw3[0], _sw3[1], _seg_len_s, bridge_wall_thickness, jnp.degrees(_theta2_s)),
         ]
 
         bearing = graph.env_states.bearing
@@ -879,6 +977,8 @@ class LidarEnv(MultiAgentEnv, ABC):
                 bridge_wall_thickness=bridge_wall_thickness,
                 bridge_theta=bridge_theta,
                 terrain_config=terrain_config,
+                bridge_length=bridge_length,
+                bridge_bend_angle=bridge_bend_angle,
             )
         )(next_agent_base_states[:, :2])  # (n_agents,)
         next_terrain_oh = jax.nn.one_hot(next_terrain_ids, self.terrain_oh_dim)  # (n_agents, 3)
@@ -925,6 +1025,8 @@ class LidarEnv(MultiAgentEnv, ABC):
             next_agent_base_states, obstacles,
             bridge_center, bridge_gap_width,
             bridge_wall_thickness, bridge_theta, terrain_config,
+            bridge_length=bridge_length,
+            bridge_bend_angle=bridge_bend_angle,
         )
         lidar_hit_terrain_ids_next = merge01(lidar_terrain_ids_next)  # (n_agents * 2*n_rays,)
         lidar_hit_positions_next   = merge01(lidar_data_next)         # (n_agents * 2*n_rays, 2)
@@ -946,6 +1048,7 @@ class LidarEnv(MultiAgentEnv, ABC):
             bridge_gap_width,
             bridge_wall_thickness,
             bridge_theta,
+            bridge_bend_angle,
             terrain_config,
         )
 
