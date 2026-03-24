@@ -196,7 +196,8 @@ class LidarTarget(LidarEnv):
         "num_bridges": 1,
         "bridge_length_range": [0.5, 1.0],
         "bridge_gap_width_range": [0.2, 0.4],
-        "bridge_wall_thickness_range": [0.05, 0.1]
+        "bridge_wall_thickness_range": [0.05, 0.1],
+        "bridge_bend_angle_range": [-0.25, 0.25]
     }
 
     def __init__(

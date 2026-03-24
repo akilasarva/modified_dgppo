@@ -114,7 +114,7 @@ def test_rollout(
             action, rnn_state = actor(graph, rnn_state)
         else:
             action, rnn_state = actor(graph, rnn_state, key_)
-        next_graph, reward, cost, done, info = env.step(graph, action)
+        next_graph, reward, cost, done, info = env.step(graph, action, get_eval_info=True)
         return (next_graph, rnn_state), (graph, action, rnn_state, reward, cost, done, None, next_graph)
 
     keys = jax.random.split(key, env.max_episode_steps)
