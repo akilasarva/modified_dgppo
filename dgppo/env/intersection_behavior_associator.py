@@ -307,14 +307,13 @@ def visualize_intersection_terrain(
 ) -> list:
     """
     Draw intersection terrain zones as a raster background.
-    Must mirror get_intersection_terrain_id in base.py exactly.
+    Mirrors get_intersection_terrain_id in base.py exactly.
 
     Terrain IDs: 0=road (gray), 1=sidewalk (tan), 2=grass (green)
-    passage_width must equal area_size - obs_len (actual gap between obstacles).
-
-    Config 1: all sidewalk in passages, grass at obstacle corners (+0.01 sliver)
-    Config 2: road centred in each arm, sidewalk borders (SIDEWALK_BORDER wide), grass at corners
-    Config 3: sidewalk throughout, small grass disk at intersection centre, grass at corners
+    Grass = expanded per-obstacle box (obs_len + 2*SLIVER), peeking 0.01 past each obstacle edge.
+    Config 1: all sidewalk in passages
+    Config 2: road centred in each arm, sidewalk borders (SIDEWALK_BORDER wide)
+    Config 3: sidewalk throughout, small grass disk at intersection centre
     """
     from matplotlib.patches import Patch
 
@@ -322,24 +321,36 @@ def visualize_intersection_terrain(
     SIDEWALK_BORDER = 0.12
     GRASS_PATCH_RADIUS = 0.10
 
+    obs_len = side_length - passage_width   # area_size - (area_size - obs_len)
+    obs_half = obs_len / 2.0 + SLIVER
+    S = side_length
+
     xs = np.linspace(0, side_length, resolution)
     ys = np.linspace(0, side_length, resolution)
     XX, YY = np.meshgrid(xs, ys)
 
-    # Rotate into intersection-local frame (centre at origin)
-    cos_t = np.cos(-global_angle)
-    sin_t = np.sin(-global_angle)
-    rel_x = XX - center[0]
-    rel_y = YY - center[1]
+    # Per-obstacle grass: expanded box for each of the 4 corner obstacles
+    # Obstacle thetas: [0,0],[S,0] → global_angle;  [0,S],[S,S] → pi/2+global_angle
+    def _in_obs(cx, cy, theta):
+        rx = XX - cx;  ry = YY - cy
+        lx = np.cos(-theta) * rx - np.sin(-theta) * ry
+        ly = np.sin(-theta) * rx + np.cos(-theta) * ry
+        return (np.abs(lx) <= obs_half) & (np.abs(ly) <= obs_half)
+
+    in_grass = (
+        _in_obs(0., 0., global_angle) |
+        _in_obs(S,  0., global_angle) |
+        _in_obs(0., S,  np.pi / 2.0 + global_angle) |
+        _in_obs(S,  S,  np.pi / 2.0 + global_angle)
+    )
+
+    # Passage terrain in intersection-local frame
+    cos_t = np.cos(-global_angle);  sin_t = np.sin(-global_angle)
+    rel_x = XX - center[0];  rel_y = YY - center[1]
     local_x = cos_t * rel_x - sin_t * rel_y
     local_y = sin_t * rel_x + cos_t * rel_y
 
-    half_pass = passage_width / 2.0  # = (area_size - obs_len) / 2
-
-    # Grass: obstacle corners + 0.01 sliver into each passage entrance
-    in_corner = (np.abs(local_x) >= half_pass - SLIVER) & (np.abs(local_y) >= half_pass - SLIVER)
-
-    # Passage arm membership
+    half_pass = passage_width / 2.0
     in_h = np.abs(local_y) < half_pass
     in_v = np.abs(local_x) < half_pass
     in_center_sq = in_h & in_v
@@ -347,22 +358,18 @@ def visualize_intersection_terrain(
     in_v_arm = in_v & ~in_center_sq
 
     if terrain_config == 1:
-        terrain_grid = np.where(in_corner, 2, 1)
+        terrain_grid = np.where(in_grass, 2, 1)
 
     elif terrain_config == 2:
         h_road = in_h_arm & (np.abs(local_y) < half_pass - SIDEWALK_BORDER)
         v_road = in_v_arm & (np.abs(local_x) < half_pass - SIDEWALK_BORDER)
         is_road = in_center_sq | h_road | v_road
-        terrain_grid = np.where(in_corner, 2,
-                       np.where(is_road, 0,
-                       1))
+        terrain_grid = np.where(in_grass, 2, np.where(is_road, 0, 1))
 
     else:  # config 3
         dist_from_center = np.sqrt(local_x**2 + local_y**2)
         in_central_grass = in_center_sq & (dist_from_center <= GRASS_PATCH_RADIUS)
-        terrain_grid = np.where(in_corner, 2,
-                       np.where(in_central_grass, 2,
-                       1))
+        terrain_grid = np.where(in_grass | in_central_grass, 2, 1)
 
     road_rgba  = (0.55, 0.55, 0.55, 0.45)
     side_rgba  = (0.88, 0.78, 0.50, 0.50)
