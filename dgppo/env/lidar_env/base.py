@@ -30,82 +30,63 @@ TERRAIN_NAMES = ["road", "sidewalk", "grass"]  # id: 0=road, 1=sidewalk, 2=grass
 def get_intersection_terrain_id(
     agent_pos: Array,          # shape (2,)
     center: Array,             # shape (2,) intersection center
-    passage_width: float,
-    obs_len: float,
+    passage_width: float,      # must equal area_size - obs_len
     global_angle: float,
-    area_size: float,
     terrain_config: int,
 ) -> int:
     """
     Returns terrain ID for agent_pos given intersection geometry and terrain_config.
     Terrain IDs: 0=road, 1=sidewalk, 2=grass
+    passage_width must equal area_size - obs_len (actual gap between obstacles).
 
-    Intersection terrain configs:
-      Config 1 (open sidewalk):
-        passage interior + edges -> sidewalk | obstacle corners -> grass
-        All passable area is safe sidewalk; no road zone.
-
-      Config 2 (curb-and-lane):
-        passage interior (> SIDEWALK_BORDER from wall) -> road
-        passage edge strip (<= SIDEWALK_BORDER from wall) -> sidewalk
-        obstacle corners -> grass
-        Agent should navigate along the sidewalk border rather than the road centre.
-
-      Config 3 (roundabout):
-        passage interior + edges -> sidewalk
-        small grass disk (radius GRASS_PATCH_RADIUS) at intersection centre -> grass
-        obstacle corners -> grass
-        Agent should skirt around the central grass island.
+    Config 1: all sidewalk in passages, grass at obstacle corners (+0.01 sliver)
+    Config 2: road in centre of each arm, sidewalk flanking (SIDEWALK_BORDER wide), grass at corners
+    Config 3: sidewalk throughout, small grass disk at intersection centre, grass at corners
     """
-    SIDEWALK_BORDER = 0.13   # width of sidewalk strip along passage walls (Config 2)
-    GRASS_PATCH_RADIUS = 0.12  # radius of central grass disk (Config 3)
+    SLIVER = 0.01          # grass extends this far past obstacle inner edge into passage
+    SIDEWALK_BORDER = 0.12  # sidewalk strip width along passage walls in Config 2
+    GRASS_PATCH_RADIUS = 0.10  # central grass disk radius in Config 3
 
-    # Rotate agent into intersection-local frame
+    # Rotate agent into intersection-local frame (centre at origin)
     cos_t = jnp.cos(-global_angle)
     sin_t = jnp.sin(-global_angle)
     rel = agent_pos - center
     local_x = cos_t * rel[0] - sin_t * rel[1]
     local_y = sin_t * rel[0] + cos_t * rel[1]
 
-    half_pass = passage_width / 2.0
+    half_pass = passage_width / 2.0  # = (area_size - obs_len) / 2
 
-    # Passage membership
-    in_horizontal_passage = jnp.abs(local_y) <= half_pass
-    in_vertical_passage   = jnp.abs(local_x) <= half_pass
-    in_passage            = in_horizontal_passage | in_vertical_passage   # full cross
-    in_center_square      = in_horizontal_passage & in_vertical_passage   # overlapping core
+    # Grass region: obstacle corners + 0.01 sliver into each passage entrance
+    in_corner = (jnp.abs(local_x) >= half_pass - SLIVER) & (jnp.abs(local_y) >= half_pass - SLIVER)
 
-    # Distance from the nearest passage wall, measured from *inside* the passage.
-    # = how far the agent is from the closest lateral wall of whichever passage it's in.
-    dist_h_wall = half_pass - jnp.abs(local_y)   # positive inside h-passage
-    dist_v_wall = half_pass - jnp.abs(local_x)   # positive inside v-passage
-    dist_to_wall = jnp.where(
-        in_center_square,
-        jnp.minimum(dist_h_wall, dist_v_wall),    # nearest wall of either passage
-        jnp.where(in_horizontal_passage, dist_h_wall, dist_v_wall)
-    )
+    # Passage arm membership (strict, inside the corridor)
+    in_h = jnp.abs(local_y) < half_pass
+    in_v = jnp.abs(local_x) < half_pass
+    in_center_sq = in_h & in_v
+    in_h_arm = in_h & ~in_center_sq  # horizontal arms only, not centre square
+    in_v_arm = in_v & ~in_center_sq  # vertical arms only, not centre square
 
-    # Distance from the intersection centre point (for Config 3 grass patch)
+    # Config 1: all sidewalk in passage, grass at corners
+    terrain_c1 = jnp.where(in_corner, 2, 1)
+
+    # Config 2: road centred in each arm, sidewalk borders touching obstacles
+    h_road = in_h_arm & (jnp.abs(local_y) < half_pass - SIDEWALK_BORDER)
+    v_road = in_v_arm & (jnp.abs(local_x) < half_pass - SIDEWALK_BORDER)
+    is_road = in_center_sq | h_road | v_road
+    terrain_c2 = jnp.where(in_corner, 2,
+                 jnp.where(is_road, 0,
+                 1))
+
+    # Config 3: sidewalk everywhere, small grass patch at intersection centre
     dist_from_center = jnp.sqrt(local_x ** 2 + local_y ** 2)
-    in_center_grass = in_center_square & (dist_from_center <= GRASS_PATCH_RADIUS)
-
-    # Config 1: open sidewalk — entire passage is sidewalk, obstacle corners are grass
-    terrain_c1 = jnp.where(in_passage, 1,    # sidewalk throughout passage
-                 2)                            # grass at obstacle corners
-
-    # Config 2: curb-and-lane — road interior, sidewalk border along walls, grass at corners
-    terrain_c2 = jnp.where(~in_passage, 2,                          # grass at corners
-                 jnp.where(dist_to_wall <= SIDEWALK_BORDER, 1,      # sidewalk border
-                 0))                                                  # road interior
-
-    # Config 3: roundabout — sidewalk throughout passage except central grass island
-    terrain_c3 = jnp.where(~in_passage,    2,    # grass at obstacle corners
-                 jnp.where(in_center_grass, 2,    # grass patch at intersection centre
-                 1))                               # sidewalk everywhere else in passage
+    in_central_grass = in_center_sq & (dist_from_center <= GRASS_PATCH_RADIUS)
+    terrain_c3 = jnp.where(in_corner, 2,
+                 jnp.where(in_central_grass, 2,
+                 1))
 
     terrain_id = jnp.where(terrain_config == 1, terrain_c1,
                  jnp.where(terrain_config == 2, terrain_c2,
-                 terrain_c3))  # config 3 default
+                 terrain_c3))
 
     return terrain_id
 
@@ -552,7 +533,8 @@ class LidarEnv(MultiAgentEnv, ABC):
                 all_obs_theta_list.append(obs_theta)
 
                 inter_center_env_state = inter_center
-                passage_width_env_state = passage_width
+                # Actual corridor gap is determined by obstacle size, not the sampled passage_width
+                passage_width_env_state = self.area_size - obs_len
                 obs_len_env_state = obs_len
                 global_angle_env_state = global_angle
 
@@ -690,9 +672,7 @@ class LidarEnv(MultiAgentEnv, ABC):
                 get_intersection_terrain_id,
                 center=inter_center_env_state,
                 passage_width=passage_width_env_state,
-                obs_len=obs_len_env_state,
                 global_angle=global_angle_env_state,
-                area_size=self.area_size,
                 terrain_config=terrain_config,
             )
         )(states[:, :2])
@@ -782,7 +762,7 @@ class LidarEnv(MultiAgentEnv, ABC):
         current_cluster_oh = jax.nn.one_hot(current_id, self.n_cluster)
         start_cluster_oh = graph.env_states.start_cluster_oh        
         next_cluster_oh = graph.env_states.next_cluster_oh
-        # jd.print("current:{}, start: {}, end: {}", current_id, jnp.argmax(start_cluster_oh), jnp.argmax(next_cluster_oh))
+        jd.print("current:{}, start: {}, end: {}", current_id, jnp.argmax(start_cluster_oh), jnp.argmax(next_cluster_oh))
         action = self.clip_action(action)
         next_agent_base_states = self.agent_step_euler(agent_base_states, action)
 
@@ -796,9 +776,7 @@ class LidarEnv(MultiAgentEnv, ABC):
                 get_intersection_terrain_id,
                 center=inter_center,
                 passage_width=passage_width,
-                obs_len=obs_len,
                 global_angle=global_angle,
-                area_size=self.area_size,
                 terrain_config=terrain_config,
             )
         )(next_agent_base_states[:, :2])
@@ -883,7 +861,7 @@ class LidarEnv(MultiAgentEnv, ABC):
             side_length=self.area_size,
             dim=2, # Assuming 2D for buildings environment visualization
             n_agent=self.num_agents,
-            n_rays=self.params["top_k_rays"] if self.params["n_obs"] > 0 or self.params["num_intersections"] > 0 else 0,
+            n_rays=self.params["top_k_rays"] if self.params["n_obs"] > 0 or self.params["num_buildings"] > 0 else 0,
             r=self.params["car_radius"],
             obs_r=0.0,
             cost_components=self.cost_components,

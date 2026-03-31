@@ -307,20 +307,26 @@ def visualize_intersection_terrain(
 ) -> list:
     """
     Draw intersection terrain zones as a raster background.
+    Must mirror get_intersection_terrain_id in base.py exactly.
 
     Terrain IDs: 0=road (gray), 1=sidewalk (tan), 2=grass (green)
+    passage_width must equal area_size - obs_len (actual gap between obstacles).
 
-    Config 1: road in passage, sidewalk 0–0.1 from passage edge, grass elsewhere
-    Config 2: road in passage, sidewalk 0–0.1 from edge, sidewalk near boundary, grass elsewhere
-    Config 3: road in passage, road halo 0–0.08, sidewalk ring 0.08–0.2, grass elsewhere
+    Config 1: all sidewalk in passages, grass at obstacle corners (+0.01 sliver)
+    Config 2: road centred in each arm, sidewalk borders (SIDEWALK_BORDER wide), grass at corners
+    Config 3: sidewalk throughout, small grass disk at intersection centre, grass at corners
     """
     from matplotlib.patches import Patch
+
+    SLIVER = 0.01
+    SIDEWALK_BORDER = 0.12
+    GRASS_PATCH_RADIUS = 0.10
 
     xs = np.linspace(0, side_length, resolution)
     ys = np.linspace(0, side_length, resolution)
     XX, YY = np.meshgrid(xs, ys)
 
-    # Rotate into intersection-local frame
+    # Rotate into intersection-local frame (centre at origin)
     cos_t = np.cos(-global_angle)
     sin_t = np.sin(-global_angle)
     rel_x = XX - center[0]
@@ -328,38 +334,35 @@ def visualize_intersection_terrain(
     local_x = cos_t * rel_x - sin_t * rel_y
     local_y = sin_t * rel_x + cos_t * rel_y
 
-    half_pass = passage_width / 2.0
+    half_pass = passage_width / 2.0  # = (area_size - obs_len) / 2
 
-    in_horizontal = np.abs(local_y) <= half_pass
-    in_vertical   = np.abs(local_x) <= half_pass
-    in_road = in_horizontal | in_vertical
+    # Grass: obstacle corners + 0.01 sliver into each passage entrance
+    in_corner = (np.abs(local_x) >= half_pass - SLIVER) & (np.abs(local_y) >= half_pass - SLIVER)
 
-    # Distance from nearest road edge
-    dist_to_h_pass = np.maximum(np.abs(local_y) - half_pass, 0.0)
-    dist_to_v_pass = np.maximum(np.abs(local_x) - half_pass, 0.0)
-    dist_to_road = np.where(in_road, 0.0, np.minimum(dist_to_h_pass, dist_to_v_pass))
-
-    # Distance from env boundary (0-to-side_length coords)
-    dist_to_boundary = np.minimum(
-        np.minimum(XX, side_length - XX),
-        np.minimum(YY, side_length - YY),
-    )
-    near_boundary = dist_to_boundary < 0.2
+    # Passage arm membership
+    in_h = np.abs(local_y) < half_pass
+    in_v = np.abs(local_x) < half_pass
+    in_center_sq = in_h & in_v
+    in_h_arm = in_h & ~in_center_sq
+    in_v_arm = in_v & ~in_center_sq
 
     if terrain_config == 1:
-        terrain_grid = np.where(in_road, 0,
-                       np.where(dist_to_road <= 0.1, 1,
-                       2))
+        terrain_grid = np.where(in_corner, 2, 1)
+
     elif terrain_config == 2:
-        terrain_grid = np.where(in_road, 0,
-                       np.where(dist_to_road <= 0.1, 1,
-                       np.where(near_boundary, 1,
-                       2)))
+        h_road = in_h_arm & (np.abs(local_y) < half_pass - SIDEWALK_BORDER)
+        v_road = in_v_arm & (np.abs(local_x) < half_pass - SIDEWALK_BORDER)
+        is_road = in_center_sq | h_road | v_road
+        terrain_grid = np.where(in_corner, 2,
+                       np.where(is_road, 0,
+                       1))
+
     else:  # config 3
-        terrain_grid = np.where(in_road, 0,
-                       np.where(dist_to_road <= 0.08, 0,
-                       np.where(dist_to_road <= 0.2, 1,
-                       2)))
+        dist_from_center = np.sqrt(local_x**2 + local_y**2)
+        in_central_grass = in_center_sq & (dist_from_center <= GRASS_PATCH_RADIUS)
+        terrain_grid = np.where(in_corner, 2,
+                       np.where(in_central_grass, 2,
+                       1))
 
     road_rgba  = (0.55, 0.55, 0.55, 0.45)
     side_rgba  = (0.88, 0.78, 0.50, 0.50)

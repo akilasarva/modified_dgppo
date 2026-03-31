@@ -102,6 +102,7 @@ class LidarTarget(LidarEnv):
         "intersection_size_range": [0.35, 0.5], # Overall size of the intersection region
         "passage_width_range": [0.45, 0.55], # Min/max for the width of the road passages
         "obs_wall_range": [1, 1.2],
+        "building_theta_range": [0, 0] #jnp.pi/6],
     }
 
     def __init__(
@@ -145,27 +146,29 @@ class LidarTarget(LidarEnv):
         reward = dense_reward * self.COSINE_SIM_REWARD_COEFF
         #jdebug.print("dense: {}", reward)
 
-        is_intersection_env = env_states.passage_width > 0
-
+        is_building_env = env_states.passage_width > 0
+        
         vmap_cluster_reward_fn = jax_vmap(ft.partial(
             _calculate_cluster_reward_per_agent,
             stay_in_cluster_bonus=self.STAY_IN_CLUSTER_BONUS,
             next_cluster_bonus=self.NEXT_CLUSTER_BONUS,
             incorrect_cluster_penalty=self.INCORRECT_CLUSTER_PENALTY,
-        ), in_axes=(0, 0, 0, 0)) # vmap over current, start, next, and bonus_awarded_state
+        ), in_axes=(0, 0, 0, 0)) # vmap over agent_pos_i, current, start, next, and bonus_awarded_state
 
+        # The function call should NOT include next_cluster_bonus again
         per_agent_reward, per_agent_bonus_awarded_updated = vmap_cluster_reward_fn(
-            current_cluster_oh_episode,
+            current_cluster_oh_episode, 
             start_cluster_oh_episode,
-            next_cluster_oh_episode,
+            next_cluster_oh_episode, 
             bonus_awarded_state
         )
 
         # Use jnp.where separately for each output
-        reward_cluster = jnp.where(is_intersection_env, per_agent_reward, 0.0)
-        next_cluster_bonus_awarded_updated = jnp.where(is_intersection_env, per_agent_bonus_awarded_updated, bonus_awarded_state)
+        reward_cluster = jnp.where(is_building_env, per_agent_reward, 0.0)
+        next_cluster_bonus_awarded_updated = jnp.where(is_building_env, per_agent_bonus_awarded_updated, bonus_awarded_state)
 
         reward += jnp.mean(reward_cluster)
+        #jdebug.print("cluster: {}", jnp.mean(reward_cluster))
 
         velocity_magnitude_sq = jnp.linalg.norm(agent_vel, axis=1) ** 2
         velocity_penalty = jnp.where(is_in_next_cluster, velocity_magnitude_sq, 0.0).mean()
@@ -174,6 +177,8 @@ class LidarTarget(LidarEnv):
         # ── Terrain reward (intersection-graded) ──
         current_terrain_oh = env_states.current_terrain_oh          # (n_agents, 3)
         current_terrain_id = jnp.argmax(current_terrain_oh, axis=-1) # (n_agents,)
+
+        is_intersection_env = env_states.passage_width > 0
 
         # Immediate terrain signal: road=-1.0, grass=-0.3, sidewalk=+0.5
         # (TERRAIN_NAMES order: 0=road, 1=sidewalk, 2=grass)
