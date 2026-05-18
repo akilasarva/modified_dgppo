@@ -190,71 +190,15 @@ def _get_semantic_lidar_single(
     # ── Obstacle hit alphas (one per ray) ──────────────────────────────────
     alphas_obs = get_ray_alphas(starts, ends, obstacles)               # (B,)
 
-    # ── Terrain boundary alphas: 4 borders per segment, 8 total ────────────
-    half_gap        = bridge_gap_width / 2.0
-    full_half       = half_gap + bridge_wall_thickness
-    sidewalk_border = bridge_gap_width * 0.2
-    road_half       = half_gap - sidewalk_border
-
-    # Sidewalk zone borders in perpendicular coords (shared by both segments).
-    # Config 1: ±full_half (repeated). Config 2: ±road_half and ±half_gap.
-    borders_c1 = jnp.array([ full_half, -full_half,  full_half, -full_half])
-    borders_c2 = jnp.array([ road_half, -road_half,  half_gap,  -half_gap])
-    seg_borders = jnp.where(terrain_config == 1, borders_c1, borders_c2)  # (4,)
-
-    eps = 1e-8
-
-    def _seg_alphas(seg_center, seg_theta):
-        """Compute (B, 4) validated alphas for one corridor segment."""
-        cos_s = jnp.cos(seg_theta)
-        sin_s = jnp.sin(seg_theta)
-        dx0   = agent_pos[0] - seg_center[0]
-        dy0   = agent_pos[1] - seg_center[1]
-        perp_start = -sin_s * dx0 + cos_s * dy0               # scalar
-        perp_dirs  = -sin_s * dirs[:, 0] + cos_s * dirs[:, 1] # (B,)
-        safe_pd    = jnp.where(jnp.abs(perp_dirs) > eps, perp_dirs, eps)
-        alphas = (seg_borders[None, :] - perp_start) / (safe_pd[:, None] * sense_range)  # (B, 4)
-        valid  = (alphas > 1e-4) & (alphas < 1.0) & (jnp.abs(perp_dirs[:, None]) > eps)
-        return jnp.where(valid, alphas, 2.0)                   # (B, 4)
-
-    # Segment 1 center: bridge_center displaced backward along seg-1 axis by seg_quarter
-    seg_quarter = bridge_length / 4.0
-    seg1_center = bridge_center - seg_quarter * jnp.array([jnp.cos(bridge_theta), jnp.sin(bridge_theta)])
-    alphas_seg1 = _seg_alphas(seg1_center, bridge_theta)       # (B, 4)
-
-    # Segment 2 center: bridge_center displaced forward along seg-2 axis by seg_quarter
-    theta2      = bridge_theta + bridge_bend_angle
-    seg2_center = bridge_center + seg_quarter * jnp.array([jnp.cos(theta2), jnp.sin(theta2)])
-    alphas_seg2 = _seg_alphas(seg2_center, theta2)             # (B, 4)
-
-    # Combine: nearest valid boundary across both segments
-    alphas_all     = jnp.concatenate([alphas_seg1, alphas_seg2], axis=-1)  # (B, 8)
-    alphas_terrain = alphas_all.min(axis=-1)                               # (B,)
-
     # ── Build hit points ────────────────────────────────────────────────────
-    obs_hits      = agent_pos[None, :] + alphas_obs[:, None]     * sense_range * dirs  # (B, 2)
-    boundary_hits = agent_pos[None, :] + alphas_terrain[:, None] * sense_range * dirs  # (B, 2)
-    hit_points    = jnp.concatenate([obs_hits, boundary_hits])                          # (2B, 2)
+    # Boundary hits hard-coded to zeros; terrain IDs all Grass=1.
+    # Matches execution: spot_dgppo_ros_node.py bnd_hits = np.zeros((n_rays, 2))
+    # and all_terrain_ids = np.ones(2*n_rays).
+    obs_hits      = agent_pos[None, :] + alphas_obs[:, None] * sense_range * dirs  # (B, 2)
+    boundary_hits = jnp.zeros_like(obs_hits)                                        # (B, 2)
+    hit_points    = jnp.concatenate([obs_hits, boundary_hits])                      # (2B, 2)
 
-    _get_tid = ft.partial(
-        get_terrain_id,
-        bridge_center=bridge_center,
-        bridge_gap_width=bridge_gap_width,
-        bridge_wall_thickness=bridge_wall_thickness,
-        bridge_theta=bridge_theta,
-        terrain_config=terrain_config,
-        bridge_length=bridge_length,
-        bridge_bend_angle=bridge_bend_angle,
-    )
-
-    # ── Terrain IDs ─────────────────────────────────────────────────────────
-    obs_terrain_ids = jax_vmap(_get_tid)(obs_hits)                         # (B,)
-
-    BOUNDARY_STEP = 0.005
-    boundary_beyond      = boundary_hits + BOUNDARY_STEP * dirs            # (B, 2)
-    boundary_terrain_ids = jax_vmap(_get_tid)(boundary_beyond)             # (B,)
-
-    terrain_ids = jnp.concatenate([obs_terrain_ids, boundary_terrain_ids]) # (2B,)
+    terrain_ids = jnp.ones(2 * num_beams, dtype=jnp.int32)  # all Grass, matches execution
 
     return hit_points, terrain_ids
 
